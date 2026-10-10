@@ -21,6 +21,7 @@ pub enum Action {
     ScopeBranch,
     ScopeLastTurn,
     ScopeCommits,
+    ScopeUnstaged,
     BasePick,
     CommitPick,
     TabChanges,
@@ -47,6 +48,8 @@ pub enum Action {
     Copy,
     OpenPr,
     Refresh,
+    /// Stage the open file in the real index; Unstaged only.
+    StageFile,
     Quit,
     /// Quit and drop unsent comments; its own key, so a held `q` can't answer its own question.
     QuitDiscard,
@@ -151,7 +154,7 @@ impl Key {
 }
 
 /// Every action with its config name and default keys, the one table the keymap derives from.
-const ACTIONS: [(Action, &str, &[Key]); 44] = [
+const ACTIONS: [(Action, &str, &[Key]); 46] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -164,10 +167,11 @@ const ACTIONS: [(Action, &str, &[Key]); 44] = [
     (Action::PageDown, "page-down", &[Key::named(KeyCode::PageDown)]),
     (Action::HalfUp, "half-up", &[Key::ctrl('u')]),
     (Action::HalfDown, "half-down", &[Key::ctrl('d')]),
-    (Action::ScopeUncommitted, "scope-uncommitted", &[Key::plain('u')]),
+    (Action::ScopeUnstaged, "scope-unstaged", &[Key::plain('u')]),
     (Action::ScopeBranch, "scope-branch", &[Key::plain('b')]),
     (Action::ScopeLastTurn, "scope-last-turn", &[Key::plain('t')]),
     (Action::ScopeCommits, "scope-commits", &[Key::plain('g')]),
+    (Action::ScopeUncommitted, "scope-uncommitted", &[Key::plain('U')]),
     (Action::BasePick, "base-pick", &[Key::plain('B')]),
     (Action::CommitPick, "commit-pick", &[Key::plain('G')]),
     (Action::TabChanges, "tab-changes", &[Key::plain('1')]),
@@ -194,6 +198,7 @@ const ACTIONS: [(Action, &str, &[Key]); 44] = [
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
     (Action::Refresh, "refresh", &[Key::plain('r')]),
+    (Action::StageFile, "stage-file", &[Key::plain('a')]),
     (Action::Quit, "quit", &[Key::plain('q')]),
     (Action::QuitDiscard, "quit-discard", &[Key::plain('Q')]),
 ];
@@ -322,6 +327,9 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('p')), Some(Action::NavigatorPosition));
         assert_eq!(keymap.action_for(Key::plain('z')), Some(Action::NavigatorHide));
         assert_eq!(keymap.action_for(Key::plain('x')), None);
+        assert_eq!(keymap.action_for(Key::plain('a')), Some(Action::StageFile));
+        assert_eq!(keymap.action_for(Key::plain('u')), Some(Action::ScopeUnstaged));
+        assert_eq!(keymap.action_for(Key::plain('U')), Some(Action::ScopeUncommitted));
         assert_eq!(keymap.action_for(Key::plain('g')), Some(Action::ScopeCommits));
         assert_eq!(keymap.action_for(Key::plain('G')), Some(Action::CommitPick));
         assert_eq!(keymap.action_for(Key::plain('?')), Some(Action::Keys));

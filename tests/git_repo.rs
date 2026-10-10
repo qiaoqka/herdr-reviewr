@@ -10,9 +10,9 @@ use herdr_reviewr::git::{
     DiffSides, ResolvedBase, abbreviate_oid, all_files, changed_between, changed_from,
     checked_out_branch, default_branch_name, delete_base_pick, diff_sides, list_branches,
     merge_base as merge_base_oid, read_base_pick, read_baseline_ref, resolve_base, resolve_commit,
-    snapshot_worktree, write_base_pick, write_baseline_ref,
+    snapshot_worktree, stage_path, write_base_pick, write_baseline_ref,
 };
-use herdr_reviewr::model::{ChangeKind, ChangedFile, Scope};
+use herdr_reviewr::model::{ChangeKind, ChangedFile, DiffBase, Scope};
 use herdr_reviewr::world::{WorldInput, build_changed};
 
 fn by_path(files: &[ChangedFile]) -> HashMap<&str, &ChangedFile> {
@@ -1842,4 +1842,154 @@ fn concurrent_snapshots_of_one_worktree_all_land_the_same_tree() {
         .map(|tree| tree.expect("a snapshot failed"))
         .collect();
     assert!(trees.windows(2).all(|w| w[0] == w[1]), "snapshots disagree: {trees:?}");
+}
+
+fn path_names(files: &[ChangedFile]) -> Vec<&str> {
+    let mut names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    names.sort_unstable();
+    names
+}
+
+fn index_listing(repo: &Repo) -> String {
+    repo.git(&["ls-files", "-s"])
+}
+
+/// HEAD, a partial index, and a dirtier worktree, plus untracked and ignored files.
+fn three_tree_repo() -> Repo {
+    let r = Repo::init();
+    r.write("staged.txt", "HEAD\n");
+    r.write("unstaged.txt", "HEAD\n");
+    r.write("deleted.txt", "HEAD\n");
+    r.write("partial.txt", "first=HEAD\nkeep\nlast=HEAD\n");
+    r.write(".gitignore", "ignored.txt\n");
+    r.commit_all("init");
+    r.write("staged.txt", "INDEX\n");
+    r.write("partial.txt", "first=INDEX\nkeep\nlast=HEAD\n");
+    r.git(&["add", "--", "staged.txt", "partial.txt"]);
+    r.write("partial.txt", "first=INDEX\nkeep\nlast=WORKTREE\n");
+    r.write("unstaged.txt", "WORKTREE\n");
+    r.remove("deleted.txt");
+    r.write("untracked.txt", "NEW\n");
+    r.write("ignored.txt", "nope\n");
+    r
+}
+
+#[test]
+fn unstaged_lists_the_worktree_against_the_index() {
+    let r = three_tree_repo();
+    let before = index_listing(&r);
+    let status_before = r.git(&["status", "--porcelain"]);
+    let unstaged = changed_files(r.path(), Scope::Unstaged, None).unwrap();
+    let names = path_names(&unstaged);
+    assert_eq!(names, ["deleted.txt", "partial.txt", "unstaged.txt", "untracked.txt"]);
+    assert!(!names.contains(&"staged.txt"), "a fully staged path is not unstaged");
+    assert!(!names.contains(&"ignored.txt"));
+
+    let by = by_path(&unstaged);
+    assert_eq!(by["untracked.txt"].kind, ChangeKind::Untracked);
+    assert_eq!(by["deleted.txt"].kind, ChangeKind::Deleted);
+
+    let sides = diff_sides(r.path(), DiffBase::Index, None, "partial.txt", None).unwrap();
+    let DiffSides::Text { old, new } = sides else { panic!("partial.txt is text") };
+    assert!(old.contains("first=INDEX"), "{old}");
+    assert!(!old.contains("WORKTREE"), "{old}");
+    assert!(new.contains("last=WORKTREE"), "{new}");
+
+    let uncommitted_files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
+    let uncommitted = path_names(&uncommitted_files);
+    assert!(uncommitted.contains(&"staged.txt"), "uncommitted still includes a fully staged path");
+
+    assert_eq!(before, index_listing(&r), "the real index is not rewritten");
+    assert_eq!(status_before, r.git(&["status", "--porcelain"]), "the worktree is not rewritten");
+}
+
+#[test]
+fn stage_path_writes_the_real_index() {
+    let r = three_tree_repo();
+    stage_path(r.path(), "unstaged.txt").unwrap();
+    let cached = r.git(&["diff", "--cached", "--name-only"]);
+    assert!(cached.contains("unstaged.txt"), "{cached}");
+    assert!(r.git(&["diff", "--", "unstaged.txt"]).trim().is_empty());
+    let unstaged = changed_files(r.path(), Scope::Unstaged, None).unwrap();
+    let names = path_names(&unstaged);
+    assert!(!names.contains(&"unstaged.txt"), "staged path leaves Unstaged: {names:?}");
+    assert!(names.contains(&"partial.txt"), "siblings stay unstaged: {names:?}");
+}
+
+#[test]
+fn unstaged_omits_a_fully_staged_rename() {
+    let r = Repo::init();
+    r.write("a.txt", "x\n");
+    r.commit_all("init");
+    r.git(&["mv", "a.txt", "b.txt"]);
+    let unstaged = changed_files(r.path(), Scope::Unstaged, None).unwrap();
+    let names = path_names(&unstaged);
+    assert!(names.is_empty(), "a staged rename with no further edit is not unstaged: {names:?}");
+    let uncommitted_files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
+    let uncommitted = path_names(&uncommitted_files);
+    assert_eq!(uncommitted, ["b.txt"]);
+}
+
+#[test]
+fn unstaged_is_empty_when_an_unborn_repo_is_fully_staged() {
+    let r = Repo::init();
+    r.write("fresh.rs", "one\n");
+    r.git(&["add", "--", "fresh.rs"]);
+    let unstaged = changed_files(r.path(), Scope::Unstaged, None).unwrap();
+    assert!(unstaged.is_empty(), "worktree matches the index: {unstaged:?}");
+    let uncommitted_files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
+    let uncommitted = path_names(&uncommitted_files);
+    assert_eq!(uncommitted, ["fresh.rs"]);
+}
+
+#[test]
+fn unmerged_unstaged_sides_fail_instead_of_reading_empty() {
+    let r = Repo::init();
+    r.write("f.txt", "base\n");
+    r.commit_all("conflict base");
+    r.git(&["checkout", "-qb", "other"]);
+    r.write("f.txt", "other\n");
+    r.commit_all("conflict other");
+    r.git(&["checkout", "-q", "main"]);
+    r.write("f.txt", "main\n");
+    r.commit_all("conflict main");
+    let merge = std::process::Command::new("git")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@herdr.test")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@herdr.test")
+        .args(["-C", r.path().to_str().unwrap(), "merge", "other"])
+        .output()
+        .unwrap();
+    assert!(!merge.status.success(), "the merge must conflict");
+    assert!(
+        r.git(&["status", "--short"]).contains("UU f.txt"),
+        "{}",
+        r.git(&["status", "--short"])
+    );
+
+    let files = changed_files(r.path(), Scope::Unstaged, None).unwrap();
+    assert!(path_names(&files).contains(&"f.txt"), "{files:?}");
+    let err = diff_sides(r.path(), DiffBase::Index, None, "f.txt", None).unwrap_err();
+    assert!(!err.to_string().is_empty(), "{err:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn unstaged_mode_only_reads_the_index_blob_on_both_sides() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = Repo::init();
+    r.write("script.sh", "echo hi\n");
+    r.commit_all("init");
+    let at = r.path().join("script.sh");
+    let mut perm = std::fs::metadata(&at).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&at, perm).unwrap();
+
+    let files = changed_files(r.path(), Scope::Unstaged, None).unwrap();
+    assert!(path_names(&files).contains(&"script.sh"), "{files:?}");
+    let sides = diff_sides(r.path(), DiffBase::Index, None, "script.sh", None).unwrap();
+    let DiffSides::Text { old, new } = sides else { panic!("mode-only is text") };
+    assert_eq!(old, new);
+    assert!(old.contains("echo hi"), "{old}");
 }

@@ -2643,25 +2643,38 @@ fn last_turn_shows_a_change_producing_turn() {
 }
 
 #[test]
-fn a_question_only_turn_keeps_the_previous_turns_diff() {
+fn a_new_turn_clears_last_turn_until_it_writes() {
     let r = Repo::init();
     r.write("a.rs", "one\n");
     r.commit_all("init");
     let (mut app, mut host) = turn_setup(&r);
-    // Turn A edits a file.
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
     write_in_turn(&mut app, &mut host, &r, "a.rs", "one\ntwo\n");
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
-    // Turn B is a question — no file change.
+    app.reload().unwrap();
+    assert!(app.entries.iter().any(|f| f.path == "a.rs"), "the first turn's edit shows");
+    observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
+    observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
+    app.reload().unwrap();
+    assert!(app.entries.is_empty(), "a new turn starts from the current tree, so last-turn is empty");
+}
+
+#[test]
+fn a_question_only_turn_clears_the_previous_turns_diff() {
+    let r = Repo::init();
+    r.write("a.rs", "one\n");
+    r.commit_all("init");
+    let (mut app, mut host) = turn_setup(&r);
+    observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
+    observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
+    write_in_turn(&mut app, &mut host, &r, "a.rs", "one\ntwo\n");
+    observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
     app.reload().unwrap();
-    assert!(
-        app.entries.iter().any(|f| f.path == "a.rs"),
-        "A's diff persists across a question-only turn"
-    );
+    assert!(app.entries.is_empty(), "a new turn that wrote nothing leaves last-turn empty");
 }
 
 #[test]
@@ -2929,16 +2942,18 @@ fn only_a_net_change_promotes_a_turn() {
     r.write("a.rs", "one\n");
     r.commit_all("init");
     let (_, mut host) = started_turn(&r);
+    let start = host.baseline().map(str::to_string);
+    assert!(start.is_some(), "a new turn publishes its start snapshot");
     // A temp file made and removed, a touch, an identical rewrite: nothing changed on net.
     r.write("tmp.swp", "x\n");
     r.remove("tmp.swp");
     assert!(!fed(&mut host, later(), &["tmp.swp"]), "a temp file come and gone");
     r.write("a.rs", "one\n");
     assert!(!fed(&mut host, later(), &["a.rs"]), "an identical rewrite or a touch");
-    assert_eq!(host.baseline(), None, "the turn stays pending");
+    assert_eq!(host.baseline().map(str::to_string), start, "the start snapshot stays");
     r.write("a.rs", "one\ntwo\n");
-    assert!(fed(&mut host, later(), &["a.rs"]), "a real change promotes");
-    assert!(host.baseline().is_some());
+    assert!(fed(&mut host, later(), &["a.rs"]), "a real change is this turn's");
+    assert_eq!(host.baseline().map(str::to_string), start);
     assert_eq!(herdr_reviewr::git::read_baseline_ref(r.path()).as_deref(), host.baseline());
 }
 
@@ -2989,10 +3004,12 @@ fn a_question_only_turns_snapshot_expires_at_its_end() {
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
     // Turn B asks a question and ends; the reviewer then edits.
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
+    let turn_b = host.baseline().map(str::to_string);
+    assert_ne!(turn_b, turn_a, "a new turn publishes a new start");
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
     r.write("a.rs", "reviewer\n");
     assert!(!fed(&mut host, later(), &["a.rs"]), "the reviewer's edit is not turn B's");
-    assert_eq!(host.baseline().map(str::to_string), turn_a, "turn A's diff stays");
+    assert_eq!(host.baseline().map(str::to_string), turn_b, "turn B's empty start stays");
 }
 
 #[test]
@@ -3009,12 +3026,12 @@ fn a_turn_the_watcher_missed_is_judged_at_its_end() {
     assert!(ended.ended);
     assert!(host.baseline().is_some(), "promoted at its end");
 
-    // Another down turn that wrote nothing drops its snapshot.
-    let turn_a = host.baseline().map(str::to_string);
+    // Another down turn that wrote nothing keeps the start it published.
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
+    let turn_b = host.baseline().map(str::to_string);
     host.watcher_down(true);
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
-    assert_eq!(host.baseline().map(str::to_string), turn_a, "nothing changed, nothing moved");
+    assert_eq!(host.baseline().map(str::to_string), turn_b, "nothing changed, nothing moved");
 }
 
 #[test]
@@ -7508,9 +7525,9 @@ fn enter_picks_the_highlight_and_switches_to_the_commits_scope() {
     assert_eq!(app.scope, Scope::Commits);
     assert_eq!(changed_paths(&app), ["two.rs"]);
 
-    // The chip's `commits` step does the same.
+    // The picker can switch back to a live pick the same way `g` does.
     app.set_scope(Scope::LastTurn).unwrap();
-    app.set_scope(app.scope.cycle()).unwrap();
+    app.set_scope(Scope::Commits).unwrap();
     assert_eq!(app.scope, Scope::Commits);
 }
 
@@ -7589,6 +7606,7 @@ fn every_other_key_is_inert_inside_the_commit_picker() {
         KeyCode::Char('2'),
         KeyCode::Char('3'),
         KeyCode::Char('u'),
+        KeyCode::Char('U'),
         KeyCode::Char('b'),
         KeyCode::Char('t'),
         KeyCode::Char('g'),
@@ -7717,23 +7735,291 @@ fn a_gone_pick_reads_as_gone_and_g_reopens_the_picker() {
     press(&mut app, &keymap, KeyCode::Char('g'));
     assert_eq!(app.mode, Mode::CommitPick);
     assert_eq!(app.scope, Scope::Uncommitted, "without switching");
-    // The chip's cycle skips the gone pick.
+    // The picker still hands a gone pick to CommitPick.
     press(&mut app, &keymap, KeyCode::Esc);
     app.set_scope(Scope::LastTurn).unwrap();
-    assert_eq!(app.next_chip_scope(), Scope::Uncommitted);
+    app.open_scope_picker();
+    let commits =
+        herdr_reviewr::app::SCOPE_PICK_ROWS.iter().position(|s| *s == Scope::Commits).unwrap();
+    app.scope_picker_goto(commits);
+    app.scope_picker_pick().unwrap();
+    assert_eq!(app.mode, Mode::CommitPick, "gone pick opens the commit picker");
+    assert_eq!(app.scope, Scope::LastTurn, "without switching");
 }
 
 #[test]
-fn the_chip_skips_commits_until_a_pick_exists() {
+fn the_scope_picker_opens_commits_only_with_a_live_pick() {
     let (r, _) = commits_repo();
     let mut app = app_on(&r);
     let keymap = Keymap::default();
     app.set_scope(Scope::LastTurn).unwrap();
-    assert_eq!(app.next_chip_scope(), Scope::Uncommitted, "no pick yet");
+    app.open_scope_picker();
+    let commits =
+        herdr_reviewr::app::SCOPE_PICK_ROWS.iter().position(|s| *s == Scope::Commits).unwrap();
+    app.scope_picker_goto(commits);
+    app.scope_picker_pick().unwrap();
+    assert_eq!(app.mode, Mode::CommitPick, "no pick yet");
+    assert_eq!(app.scope, Scope::LastTurn, "without switching");
+    press(&mut app, &keymap, KeyCode::Esc);
     press(&mut app, &keymap, KeyCode::Char('G'));
     press(&mut app, &keymap, KeyCode::Enter);
     app.set_scope(Scope::LastTurn).unwrap();
-    assert_eq!(app.next_chip_scope(), Scope::Commits, "a live pick is a chip stop");
+    app.open_scope_picker();
+    app.scope_picker_goto(commits);
+    app.scope_picker_pick().unwrap();
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.scope, Scope::Commits, "a live pick is a picker stop");
+}
+
+fn three_tree_repo() -> Repo {
+    let r = Repo::init();
+    r.write("staged.txt", "HEAD\n");
+    r.write("unstaged.txt", "HEAD\n");
+    r.write("partial.txt", "first=HEAD\nkeep\nlast=HEAD\n");
+    r.write(".gitignore", "ignored.txt\n");
+    r.commit_all("init");
+    r.write("staged.txt", "INDEX\n");
+    r.write("partial.txt", "first=INDEX\nkeep\nlast=HEAD\n");
+    r.git(&["add", "--", "staged.txt", "partial.txt"]);
+    r.write("partial.txt", "first=INDEX\nkeep\nlast=WORKTREE\n");
+    r.write("unstaged.txt", "WORKTREE\n");
+    r.write("untracked.txt", "NEW\n");
+    r.write("ignored.txt", "nope\n");
+    r
+}
+
+fn conflict_repo() -> Repo {
+    let r = Repo::init();
+    r.write("f.txt", "base\n");
+    r.commit_all("conflict base");
+    r.git(&["checkout", "-qb", "other"]);
+    r.write("f.txt", "other\n");
+    r.commit_all("conflict other");
+    r.git(&["checkout", "-q", "main"]);
+    r.write("f.txt", "main\n");
+    r.commit_all("conflict main");
+    let merge = std::process::Command::new("git")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@herdr.test")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@herdr.test")
+        .args(["-C", r.path().to_str().unwrap(), "merge", "other"])
+        .output()
+        .unwrap();
+    assert!(!merge.status.success(), "the merge must conflict");
+    r
+}
+
+fn select_path(app: &mut App, path: &str) {
+    let i = app
+        .file_rows
+        .iter()
+        .position(|row| row.file_index().is_some_and(|ei| app.entries[ei].path == path))
+        .unwrap_or_else(|| panic!("missing {path} in {:?}", changed_paths(app)));
+    app.select_file(i).unwrap();
+}
+
+#[test]
+fn plain_u_switches_unstaged_and_capital_u_returns() {
+    let r = three_tree_repo();
+    let mut app = app_on(&r);
+    let keymap = Keymap::default();
+    press(&mut app, &keymap, KeyCode::Char('u'));
+    assert_eq!(app.scope, Scope::Unstaged);
+    assert_eq!(changed_paths(&app), ["partial.txt", "unstaged.txt", "untracked.txt"]);
+    press(&mut app, &keymap, KeyCode::Char('U'));
+    assert_eq!(app.scope, Scope::Uncommitted);
+    assert!(changed_paths(&app).contains(&"staged.txt".to_string()));
+}
+
+#[test]
+fn the_scope_picker_enter_switches_and_esc_keeps_the_scope() {
+    let r = three_tree_repo();
+    let mut app = app_on(&r);
+    let keymap = Keymap::default();
+    app.open_scope_picker();
+    assert_eq!(app.mode, Mode::ScopePick);
+    press(&mut app, &keymap, KeyCode::Esc);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.scope, Scope::Uncommitted);
+    app.open_scope_picker();
+    let unstaged =
+        herdr_reviewr::app::SCOPE_PICK_ROWS.iter().position(|s| *s == Scope::Unstaged).unwrap();
+    app.scope_picker_goto(unstaged);
+    press(&mut app, &keymap, KeyCode::Enter);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.scope, Scope::Unstaged);
+    assert_eq!(changed_paths(&app), ["partial.txt", "unstaged.txt", "untracked.txt"]);
+    select_path(&mut app, "partial.txt");
+    assert!(app.diff.rows.iter().any(|row| row.text().contains("WORKTREE")));
+    assert!(app.diff.rows.iter().any(|row| row.text().contains("first=INDEX")));
+    assert!(
+        !app.diff.rows.iter().any(|row| row.text().contains("first=HEAD") && row.marker() == '-'),
+        "unstaged old side is the index, not HEAD"
+    );
+}
+
+#[test]
+fn an_unmerged_unstaged_file_is_the_unreadable_notice() {
+    let r = conflict_repo();
+    let mut app = app_on(&r);
+    app.set_scope(Scope::Unstaged).unwrap();
+    assert!(changed_paths(&app).contains(&"f.txt".to_string()), "{:?}", changed_paths(&app));
+    select_path(&mut app, "f.txt");
+    assert_eq!(app.diff.notice, Some(herdr_reviewr::diff::Notice::Unreadable));
+    assert!(app.diff.rows.is_empty(), "unmerged must not render empty sides as unchanged");
+}
+
+#[test]
+fn default_scope_unstaged_seeds_a_fresh_pane() {
+    let r = three_tree_repo();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "default_scope = \"unstaged\"\n").unwrap();
+    let config = herdr_reviewr::config::plugin_config_in(dir.path()).unwrap();
+    assert_eq!(config.default_scope(), Scope::Unstaged);
+    let mut app = App::new(r.path_buf(), config.default_scope(), None);
+    app.seed_from_config(&config);
+    app.reload().unwrap();
+    assert_eq!(app.scope, Scope::Unstaged);
+    assert_eq!(changed_paths(&app), ["partial.txt", "unstaged.txt", "untracked.txt"]);
+}
+
+#[test]
+fn a_stages_the_open_unstaged_file_and_leaves_the_list() {
+    let r = three_tree_repo();
+    let mut app = app_on(&r);
+    let keymap = Keymap::default();
+    press(&mut app, &keymap, KeyCode::Char('u'));
+    select_path(&mut app, "unstaged.txt");
+    press(&mut app, &keymap, KeyCode::Char('a'));
+    assert_eq!(
+        changed_paths(&app),
+        ["partial.txt", "untracked.txt"],
+        "the staged path leaves Unstaged"
+    );
+    let cached = r.git(&["diff", "--cached", "--name-only"]);
+    assert!(cached.contains("unstaged.txt"), "the real index gained the file:\n{cached}");
+    assert!(r.git(&["diff", "--", "unstaged.txt"]).trim().is_empty(), "worktree matches the index");
+    assert!(cached.contains("staged.txt"), "already-staged siblings stay staged");
+}
+
+#[test]
+fn a_is_inert_outside_unstaged() {
+    let r = three_tree_repo();
+    let mut app = app_on(&r);
+    let keymap = Keymap::default();
+    select_path(&mut app, "unstaged.txt");
+    press(&mut app, &keymap, KeyCode::Char('a'));
+    assert!(
+        changed_paths(&app).contains(&"unstaged.txt".to_string()),
+        "Uncommitted does not stage"
+    );
+    assert!(
+        !r.git(&["diff", "--cached", "--name-only"]).contains("unstaged.txt"),
+        "the real index is untouched"
+    );
+}
+
+/// Last-turn after `mutate`, against a snapshot taken before it.
+fn last_turn_after(r: &Repo, mutate: impl FnOnce(&Repo)) -> App {
+    let baseline = herdr_reviewr::git::snapshot_worktree(r.path()).unwrap();
+    mutate(r);
+    let mut app = app_on(r);
+    app.sync_turn(herdr_reviewr::turn::TurnReport {
+        last: herdr_reviewr::turn::LastTurn::At(baseline),
+        ..Default::default()
+    });
+    app.set_scope(Scope::LastTurn).unwrap();
+    app
+}
+
+#[test]
+fn a_on_last_turn_stages_an_unstaged_edit() {
+    let r = Repo::init();
+    r.write("a.txt", "HEAD\n");
+    r.commit_all("init");
+    let mut app = last_turn_after(&r, |r| r.write("a.txt", "DIRTY\n"));
+    select_path(&mut app, "a.txt");
+    press(&mut app, &Keymap::default(), KeyCode::Char('a'));
+    assert!(r.git(&["diff", "--cached", "--name-only"]).contains("a.txt"));
+    assert!(r.git(&["diff", "--", "a.txt"]).trim().is_empty());
+}
+
+#[test]
+fn a_on_last_turn_stages_a_new_file() {
+    let r = Repo::init();
+    r.write("kept.txt", "HEAD\n");
+    r.commit_all("init");
+    let mut app = last_turn_after(&r, |r| r.write("new.txt", "NEW\n"));
+    select_path(&mut app, "new.txt");
+    press(&mut app, &Keymap::default(), KeyCode::Char('a'));
+    assert!(r.git(&["ls-files", "--stage"]).contains("new.txt"), "untracked becomes staged");
+    assert!(!r.git(&["status", "--porcelain"]).contains("?? new.txt"));
+}
+
+#[test]
+fn a_on_last_turn_is_inert_when_already_staged() {
+    let r = Repo::init();
+    r.write("a.txt", "HEAD\n");
+    r.commit_all("init");
+    let mut app = last_turn_after(&r, |r| {
+        r.write("a.txt", "STAGED\n");
+        r.git(&["add", "--", "a.txt"]);
+    });
+    let before = r.git(&["diff", "--cached"]);
+    select_path(&mut app, "a.txt");
+    press(&mut app, &Keymap::default(), KeyCode::Char('a'));
+    assert_eq!(r.git(&["diff", "--cached"]), before, "the index stays as it was");
+    assert_eq!(app.status, "nothing to stage");
+}
+
+#[test]
+fn a_on_last_turn_is_inert_when_already_committed() {
+    let r = Repo::init();
+    r.write("a.txt", "HEAD\n");
+    r.commit_all("init");
+    let mut app = last_turn_after(&r, |r| {
+        r.write("a.txt", "COMMITTED\n");
+        r.commit_all("in turn");
+    });
+    select_path(&mut app, "a.txt");
+    press(&mut app, &Keymap::default(), KeyCode::Char('a'));
+    assert!(r.git(&["diff", "--cached", "--name-only"]).trim().is_empty());
+    assert_eq!(app.status, "nothing to stage");
+}
+
+#[test]
+fn a_stages_an_untracked_file() {
+    let r = three_tree_repo();
+    let mut app = app_on(&r);
+    let keymap = Keymap::default();
+    press(&mut app, &keymap, KeyCode::Char('u'));
+    select_path(&mut app, "untracked.txt");
+    press(&mut app, &keymap, KeyCode::Char('a'));
+    assert!(
+        !changed_paths(&app).contains(&"untracked.txt".to_string()),
+        "untracked leaves Unstaged after stage"
+    );
+    assert!(r.git(&["ls-files", "--stage"]).contains("untracked.txt"));
+}
+
+#[test]
+fn stage_is_offered_only_on_unstaged() {
+    let r = three_tree_repo();
+    let mut app = app_on(&r);
+    select_path(&mut app, "unstaged.txt");
+    app.focus = Focus::Diff;
+    assert!(
+        !app.footer_bands().iter().any(|&(a, _)| a == FooterAction::StageFile),
+        "Uncommitted does not offer stage"
+    );
+    app.set_scope(Scope::Unstaged).unwrap();
+    select_path(&mut app, "unstaged.txt");
+    app.focus = Focus::Diff;
+    assert!(
+        app.footer_bands().iter().any(|&(a, _)| a == FooterAction::StageFile),
+        "Unstaged offers stage for the open file"
+    );
 }
 
 #[test]

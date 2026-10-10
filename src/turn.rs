@@ -365,12 +365,16 @@ impl TurnHost {
         }
     }
 
-    fn promote(&mut self, candidate: String) {
-        self.turn = None;
-        if let Err(e) = git::write_baseline_ref(&self.repo, &candidate) {
+    fn publish(&mut self, candidate: &str) {
+        if let Err(e) = git::write_baseline_ref(&self.repo, candidate) {
             logln!("turn baseline ref write failed: {e}");
         }
-        self.last = LastTurn::At(candidate);
+        self.last = LastTurn::At(candidate.to_string());
+    }
+
+    fn promote(&mut self, candidate: String) {
+        self.turn = None;
+        self.publish(&candidate);
     }
 
     /// The turn rested. If the watcher missed any part of it, the worktree says whether it wrote.
@@ -426,11 +430,15 @@ impl TurnHost {
                     let snapped = Instant::now();
                     let race_from = started.checked_sub(RACE_BEFORE).unwrap_or(started);
                     let ended = None;
+                    let tree = candidate.clone();
                     self.turn =
                         Some(TurnWindow { candidate, race_from, snapped, ended, unobserved });
                     // A write from just before the edge up to the snapshot already sits in it.
                     if self.last_write.is_some_and(|w| w >= race_from && w <= snapped) {
                         self.abandon();
+                    } else {
+                        // Publish now so last-turn empties; keep the window for the race.
+                        self.publish(&tree);
                     }
                 }
                 Err(e) => logln!("turn snapshot failed: {e}"),

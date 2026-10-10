@@ -1837,6 +1837,22 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         return Ok(());
     }
 
+    // Scope picker: move, `enter` picks, `esc` closes; unbound keys are ignored.
+    if app.mode == Mode::ScopePick {
+        match (action, key.code) {
+            (_, Esc) => app.close_scope_picker(),
+            (_, Enter) => app.scope_picker_pick()?,
+            (Some(K::Down), _) => app.scope_picker_move(1),
+            (Some(K::Up), _) => app.scope_picker_move(-1),
+            (Some(K::PageDown), _) => app.scope_picker_move(PAGE),
+            (Some(K::PageUp), _) => app.scope_picker_move(-PAGE),
+            (Some(K::HalfDown), _) => app.scope_picker_move(HALF_PAGE),
+            (Some(K::HalfUp), _) => app.scope_picker_move(-HALF_PAGE),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // The read-only PR tab: navigate the snapshot and open links; authoring actions are inert.
     if app.tab == crate::app::Tab::Pr {
         match (action, key.code) {
@@ -1924,6 +1940,8 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             K::ScopeBranch => app.set_scope(Scope::Branch)?,
             K::ScopeLastTurn => app.set_scope(Scope::LastTurn)?,
             K::ScopeCommits => app.set_scope(Scope::Commits)?,
+            K::ScopeUnstaged => app.set_scope(Scope::Unstaged)?,
+            K::StageFile => app.stage_current_file()?,
             K::BasePick => app.open_base_picker(),
             K::CommitPick => app.open_commit_picker(),
             K::Select => app.toggle_select(),
@@ -2462,6 +2480,15 @@ fn dispatch_mouse(
                     None => {}
                 }
             }
+            MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::ScopePick => {
+                match ui::hit_scope_picker_row(area, app, m.column, m.row) {
+                    Some(i) if app.scope_picker.as_ref().is_some_and(|sp| sp.cursor == i) => {
+                        app.scope_picker_pick()?;
+                    }
+                    Some(i) => app.scope_picker_goto(i),
+                    None => {}
+                }
+            }
             MouseEventKind::Drag(MouseButton::Left) if app.divider_drag_captured() => {
                 return Ok(());
             }
@@ -2553,7 +2580,7 @@ fn dispatch_mouse(
             if let Some(hit) = ui::hit_header(area, app, keymap, m.column, m.row) {
                 match hit {
                     ui::HeaderHit::Tab(tab) => app.set_tab(tab)?,
-                    ui::HeaderHit::Scope => app.set_scope(app.next_chip_scope())?,
+                    ui::HeaderHit::Scope => app.open_scope_picker(),
                     // Inert under a `--base` flag.
                     ui::HeaderHit::Base => app.open_base_picker(),
                     ui::HeaderHit::Pick => app.open_commit_picker(),

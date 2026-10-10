@@ -1,4 +1,4 @@
-//! Git access; the only writes are private refs, index copies, and snapshot objects (AGENTS.md, No writes).
+//! Git access; writes are private refs, index copies, snapshot objects, and user-initiated `stage_path` (AGENTS.md, No writes).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::{Context, Result, bail};
 
-use crate::model::{ChangeKind, ChangedFile};
+use crate::model::{ChangeKind, ChangedFile, DiffBase};
 
 /// Every git process reviewr runs, read-only on the real index (**No writes**).
 fn git_command(repo: &Path) -> std::process::Command {
@@ -32,6 +32,22 @@ thread_local! {
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
     run(git_command(repo), args)
+}
+
+/// Stage one path in the real index. User-initiated; the only real-index write.
+pub fn stage_path(repo: &Path, path: &str) -> Result<()> {
+    let mut cmd = crate::proc::command("git");
+    cmd.arg("-C").arg(repo);
+    run(cmd, &["--literal-pathspecs", "add", "--", path])?;
+    Ok(())
+}
+
+/// Whether `path` has worktree content the index does not: an unstaged edit or an untracked file.
+pub fn path_has_unstaged(repo: &Path, path: &str) -> Result<bool> {
+    if !git(repo, &["diff", "--name-only", "--", path])?.trim().is_empty() {
+        return Ok(true);
+    }
+    Ok(!git(repo, &["ls-files", "--others", "--exclude-standard", "--", path])?.trim().is_empty())
 }
 
 /// Run `cmd` (a [`git_command`]) with `args` and return stdout. Errors on non-zero exit.
@@ -1247,11 +1263,12 @@ pub enum DiffSides {
 /// `path`'s sides from `old` to `new` (the worktree when `None`); a rename or copy reads `source`.
 pub fn diff_sides(
     repo: &Path,
-    old: &str,
+    old: impl Into<DiffBase>,
     new: Option<&str>,
     path: &str,
     source: Option<&str>,
 ) -> Result<DiffSides> {
+    let old = old.into();
     // Git before 2.50 overflows twice a wider context on Windows; a longer side opens too large.
     let context = format!("-U{}", crate::diff::MAX_LINES);
     let mut args = vec![
@@ -1275,8 +1292,10 @@ pub fn diff_sides(
         "--no-prefix",
         // So the one hunk is the whole file at any length reviewr shows.
         &context,
-        old,
     ];
+    if let DiffBase::Revision(rev) = &old {
+        args.push(rev.as_str());
+    }
     args.extend(new);
     args.push("--");
     args.extend(source);
@@ -1308,20 +1327,26 @@ pub fn diff_sides(
         }
         // Only its mode changed: one text both sides, which must read.
         (Side::Absent, Side::Absent, None) if own.is_some() => {
-            let text = git(repo, &["show", &format!("{}:{path}", new.unwrap_or(old))])?;
+            let text = git(repo, &["show", &show_spec(&old, new, path)])?;
             DiffSides::Text { old: text.clone(), new: text }
         }
         // git found it the same at both ends, so where `show` misses it, both ends lack it.
         (Side::Absent, Side::Absent, None) => {
-            let shown = git(repo, &["show", &format!("{}:{path}", new.unwrap_or(old))]);
-            let text = shown.unwrap_or_default();
+            let shown = git(repo, &["show", &show_spec(&old, new, path)]);
+            let text = match shown {
+                Ok(text) => text,
+                Err(error) if matches!(old, DiffBase::Index) => return Err(error),
+                Err(_) => String::new(),
+            };
             DiffSides::Text { old: text.clone(), new: text }
         }
         (old_side, new_side, source) => DiffSides::Text {
             old: match (old_side, source) {
                 (Side::Text(text), _) => text,
                 // A copy's source is unchanged, so git printed nothing for it; it must exist.
-                (Side::Absent, Some(source)) => git(repo, &["show", &format!("{old}:{source}")])?,
+                (Side::Absent, Some(source)) => {
+                    git(repo, &["show", &show_spec(&old, new, source)])?
+                }
                 _ => String::new(),
             },
             new: match new_side {
@@ -1922,17 +1947,46 @@ pub fn diff_base(head: Option<String>) -> String {
     head.unwrap_or_else(|| EMPTY_TREE.to_string())
 }
 
-/// The changeset from `base` to the worktree, untracked files included.
-pub fn changed_from(repo: &Path, base: &str) -> Result<Vec<ChangedFile>> {
-    let out = IndexCopy::with(repo, |index| index.git(repo, &diff_args(&[base])))?;
+/// A `git show` object name for `path` at `old`/`new`. Index uses `:0:path`, never a diff revision.
+fn show_spec(old: &DiffBase, new: Option<&str>, path: &str) -> String {
+    match (new, old) {
+        (Some(rev), _) => format!("{rev}:{path}"),
+        (None, DiffBase::Revision(rev)) => format!("{rev}:{path}"),
+        (None, DiffBase::Index) => format!(":0:{path}"),
+    }
+}
+
+/// The changeset from `old` to the worktree, untracked files included.
+pub fn changed_from(repo: &Path, old: impl Into<DiffBase>) -> Result<Vec<ChangedFile>> {
+    let old = old.into();
+    let out = match &old {
+        DiffBase::Index => IndexCopy::with(repo, |index| index.git(repo, &diff_args(&[])))?,
+        DiffBase::Revision(base) => {
+            IndexCopy::with(repo, |index| index.git(repo, &diff_args(&[base.as_str()])))?
+        }
+    };
     assemble(repo, &out, true, None)
 }
 
 /// [`changed_from`] limited to `paths`, each a file or a directory.
-pub fn changed_from_in(repo: &Path, base: &str, paths: &[String]) -> Result<Vec<ChangedFile>> {
+pub fn changed_from_in(
+    repo: &Path,
+    old: impl Into<DiffBase>,
+    paths: &[String],
+) -> Result<Vec<ChangedFile>> {
+    let old = old.into();
     let specs = literal_pathspecs(paths);
-    let args = with_pathspecs(diff_args(&[base]), &specs);
-    let out = IndexCopy::with(repo, |index| index.git(repo, &args))?;
+    let out = match &old {
+        DiffBase::Index => {
+            let args = with_pathspecs(diff_args(&[]), &specs);
+            IndexCopy::with(repo, |index| index.git(repo, &args))?
+        }
+        DiffBase::Revision(base) => {
+            let ends = [base.as_str()];
+            let args = with_pathspecs(diff_args(&ends), &specs);
+            IndexCopy::with(repo, |index| index.git(repo, &args))?
+        }
+    };
     assemble(repo, &out, true, Some(paths))
 }
 

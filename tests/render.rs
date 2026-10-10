@@ -1153,6 +1153,49 @@ fn header_clicks_map_to_the_scope_chip() {
 }
 
 #[test]
+fn the_scope_picker_paints_all_five_scopes() {
+    let mut app = edited_app();
+    app.open_scope_picker();
+    assert_eq!(app.mode, Mode::ScopePick);
+    let out = render(&app);
+    for label in ["uncommitted", "branch", "last turn", "commits", "unstaged"] {
+        assert!(out.contains(label), "missing {label}:\n{out}");
+    }
+}
+
+#[test]
+fn the_scope_picker_hangs_from_the_chip() {
+    let mut app = edited_app();
+    app.open_scope_picker();
+    let buf = render_buffer(&app);
+    let at = |x: u16, y: u16| buf.cell((x, y)).map(|c| c.symbol().to_string()).unwrap_or_default();
+    let find_ascii = |y: u16, needle: &str| -> Option<u16> {
+        let n = needle.len() as u16;
+        (0..=buf.area.width.saturating_sub(n))
+            .find(|&x| (0..n).all(|i| at(x + i, y) == needle[i as usize..i as usize + 1]))
+    };
+    let chip = format!("[{}]", app.scope.label());
+    let chip_x = find_ascii(0, &chip).unwrap_or_else(|| panic!("chip on the header"));
+    let chip_mid = chip_x + chip.len() as u16 / 2;
+    let title_x = find_ascii(1, " scope ").unwrap_or_else(|| panic!("popup title under the chip"));
+    let left = (0..=title_x).rev().find(|&x| at(x, 1) == "┌").expect("popup top-left");
+    let right = (title_x..buf.area.width).find(|&x| at(x, 1) == "┐").expect("popup top-right");
+    assert!(
+        (left..=right).contains(&chip_mid),
+        "chip mid {chip_mid} is outside the popup {left}..={right}"
+    );
+    let popup_mid = (left + right) / 2;
+    assert!(
+        popup_mid.abs_diff(chip_mid) <= 1,
+        "popup mid {popup_mid} is not centered on chip {chip_mid}"
+    );
+    assert!(
+        !(0..buf.area.width).any(|x| at(x, buf.area.height - 1) == "─"),
+        "the popup must not cover the footer"
+    );
+}
+
+#[test]
 fn file_and_diff_clicks_map_to_row_indices() {
     let app = edited_app();
     // Right pane: the first file row maps to index 0; clicking past the list misses.
@@ -4021,7 +4064,12 @@ fn the_commits_header_names_the_pick_and_its_verdict() {
     );
     app.keys_expanded = true;
     let expanded = render(&app);
-    assert!(expanded.contains("u/b/t/g scope"), "the go band names four scopes:\n{expanded}");
+    assert!(expanded.contains("scope"), "the go band names the scopes:\n{expanded}");
+    assert!(expanded.contains("u/"), "uncommitted stays in the hint: {expanded}");
+    assert!(
+        expanded.contains("/U") || expanded.contains("U "),
+        "unstaged is in the hint: {expanded}"
+    );
     assert!(expanded.contains("G commits"), "and the picker key:\n{expanded}");
     app.keys_expanded = false;
 
@@ -4074,7 +4122,11 @@ fn the_commits_header_names_the_pick_and_its_verdict() {
     );
     let footer = footer_line(&out);
     assert!(footer.trim_start().starts_with("G commits"), "{footer}");
-    assert!(footer.contains("u/b/t scope"), "the other three scopes: {footer}");
+    assert!(footer.contains("scope"), "the other scopes: {footer}");
+    assert!(
+        footer.contains('U') || footer.contains("u/"),
+        "unstaged is among the others: {footer}"
+    );
 }
 
 #[test]

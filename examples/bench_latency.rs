@@ -36,11 +36,11 @@ fn main() {
     println!("== {label} ==");
 
     // --- Components of reload() -------------------------------------------------
-    let changed = git::changed_from(&repo, &git::diff_base(git::head_oid(&repo))).unwrap();
+    let changed = git::changed_from(&repo, git::diff_base(git::head_oid(&repo))).unwrap();
     row(
         "changed_from (uncommitted)",
         sample(5, || {
-            git::changed_from(&repo, &git::diff_base(git::head_oid(&repo))).unwrap();
+            git::changed_from(&repo, git::diff_base(git::head_oid(&repo))).unwrap();
         }),
     );
     row(
@@ -48,7 +48,7 @@ fn main() {
         sample(5, || {
             let base = git::resolve_base(&repo, None).ok().and_then(|r| r.status.winner);
             if let Some(base) = base.and_then(|b| git::merge_base(&repo, b.oid())) {
-                git::changed_from(&repo, &base).unwrap();
+                git::changed_from(&repo, base).unwrap();
             }
         }),
     );
@@ -121,7 +121,7 @@ fn main() {
         let path = cf.path.clone();
         let base = git::diff_base(git::head_oid(&repo));
         let source = cf.previous_path.clone();
-        let sides = || match git::diff_sides(&repo, &base, None, &path, source.as_deref()) {
+        let sides = || match git::diff_sides(&repo, base.as_str(), None, &path, source.as_deref()) {
             Ok(git::DiffSides::Text { old, new }) => (old, new),
             _ => (String::new(), String::new()),
         };
@@ -157,7 +157,7 @@ fn main() {
     row(
         "TAB SWITCH -> All files (reload, no reopen)",
         sample(3, || {
-            git::changed_from(&repo, &git::diff_base(git::head_oid(&repo))).unwrap();
+            git::changed_from(&repo, git::diff_base(git::head_oid(&repo))).unwrap();
             git::all_files(&repo).unwrap();
         }),
     );

@@ -338,18 +338,19 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             path,
             "default_scope",
             value,
-            "one of uncommitted, branch, last-turn",
+            "one of uncommitted, branch, last-turn, unstaged",
         )? {
             "uncommitted" => crate::model::Scope::Uncommitted,
             "branch" => crate::model::Scope::Branch,
             "last-turn" => crate::model::Scope::LastTurn,
+            "unstaged" => crate::model::Scope::Unstaged,
             // `commits` needs a pick, so it cannot be a start scope.
             _ => {
                 return Err(value_error(
                     path,
                     value,
                     "default_scope",
-                    "one of uncommitted, branch, last-turn",
+                    "one of uncommitted, branch, last-turn, unstaged",
                 ));
             }
         };
@@ -726,6 +727,47 @@ mod tests {
     fn missing_file_uses_all_defaults() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(super::plugin_config_in(dir.path()).unwrap(), PluginConfig::default());
+    }
+
+    #[test]
+    fn default_scope_accepts_unstaged_and_the_existing_start_scopes() {
+        use crate::model::Scope;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (value, scope) in [
+            ("uncommitted", Scope::Uncommitted),
+            ("branch", Scope::Branch),
+            ("last-turn", Scope::LastTurn),
+            ("unstaged", Scope::Unstaged),
+        ] {
+            std::fs::write(&path, format!("default_scope = \"{value}\"\n")).unwrap();
+            let config = super::plugin_config_in(dir.path()).expect(value);
+            assert_eq!(config.default_scope(), scope, "{value}");
+        }
+    }
+
+    #[test]
+    fn default_scope_rejects_commits_and_names_the_start_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for entry in [
+            "default_scope = \"commits\"\n",
+            "default_scope = \"weekly\"\n",
+            "default_scope = true\n",
+        ] {
+            std::fs::write(&path, entry).unwrap();
+            let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+            assert!(error.contains("config.toml"), "{entry}: {error}");
+            assert!(error.contains("`default_scope`"), "{entry}: {error}");
+            assert!(
+                error.contains("one of uncommitted, branch, last-turn, unstaged"),
+                "{entry}: {error}"
+            );
+            assert!(
+                !error.contains("one of uncommitted, branch, last-turn, unstaged, commits"),
+                "commits is not a start scope: {entry}: {error}"
+            );
+        }
     }
 
     #[test]

@@ -8,6 +8,8 @@ pub enum Scope {
     LastTurn,
     /// A picked run of commits, diffed `A^` against `B`.
     Commits,
+    /// Worktree against the index, plus untracked. Not fully staged paths.
+    Unstaged,
 }
 
 impl Scope {
@@ -17,6 +19,7 @@ impl Scope {
             Scope::Branch => "branch",
             Scope::LastTurn => "last turn",
             Scope::Commits => "commits",
+            Scope::Unstaged => "unstaged",
         }
     }
 
@@ -27,18 +30,33 @@ impl Scope {
             Scope::Branch => "branch",
             Scope::LastTurn => "last-turn",
             Scope::Commits => "commits",
+            Scope::Unstaged => "unstaged",
         }
     }
+}
 
-    /// The next scope, for a click on the header chip.
-    #[must_use]
-    pub fn cycle(self) -> Self {
-        match self {
-            Scope::Uncommitted => Scope::Branch,
-            Scope::Branch => Scope::LastTurn,
-            Scope::LastTurn => Scope::Commits,
-            Scope::Commits => Scope::Uncommitted,
-        }
+/// The old end of a file diff: a Git revision, or the index (`git diff` with no revision).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffBase {
+    Index,
+    Revision(String),
+}
+
+impl From<&str> for DiffBase {
+    fn from(s: &str) -> Self {
+        Self::Revision(s.to_string())
+    }
+}
+
+impl From<String> for DiffBase {
+    fn from(s: String) -> Self {
+        Self::Revision(s)
+    }
+}
+
+impl From<&String> for DiffBase {
+    fn from(s: &String) -> Self {
+        Self::Revision(s.clone())
     }
 }
 
@@ -245,16 +263,14 @@ mod tests {
     }
 
     #[test]
-    fn scope_cycles_and_labels() {
-        // The chip click cycles through all four scopes and wraps.
-        assert_eq!(Scope::Uncommitted.cycle(), Scope::Branch);
-        assert_eq!(Scope::Branch.cycle(), Scope::LastTurn);
-        assert_eq!(Scope::LastTurn.cycle(), Scope::Commits);
-        assert_eq!(Scope::Commits.cycle(), Scope::Uncommitted);
+    fn scope_labels_and_config_names() {
         assert_eq!(Scope::Uncommitted.label(), "uncommitted");
         assert_eq!(Scope::LastTurn.label(), "last turn");
         assert_eq!(Scope::Commits.label(), "commits");
+        assert_eq!(Scope::Unstaged.label(), "unstaged");
         assert_eq!(Scope::Commits.name(), "commits");
+        assert_eq!(Scope::LastTurn.name(), "last-turn");
+        assert_eq!(Scope::Unstaged.name(), "unstaged");
     }
 
     #[test]

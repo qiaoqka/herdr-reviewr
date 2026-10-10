@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
+use std::sync::Arc;
 
 use similar::{ChangeTag, TextDiff};
 
@@ -419,6 +420,21 @@ fn pair_homologs(
 ) {
     let old_texts: Vec<String> = dels.clone().map(|d| rows[d].text()).collect();
     let new_texts: Vec<String> = inss.clone().map(|p| rows[p].text()).collect();
+    // Same-length replace: pair by position and always refine, like VS Code innerChanges.
+    if old_texts.len() == new_texts.len() {
+        for (k, d) in dels.enumerate() {
+            let p = inss.start + k;
+            let (_, old_e, new_e) = word_emphasis(&old_texts[k], &new_texts[k]);
+            if let Row::Deletion { emphasis, .. } = &mut rows[d] {
+                *emphasis = old_e;
+            }
+            if let Row::Insertion { emphasis, .. } = &mut rows[p] {
+                *emphasis = new_e;
+            }
+            pairs.push((d, p));
+        }
+        return;
+    }
     let mut claimed = vec![false; inss.len()];
     let mut twinned = vec![false; dels.len()];
     // Exact twins first, anywhere in the block: a line whose ending alone changed is that line.
@@ -465,9 +481,16 @@ const SIMILAR_WINDOW: usize = 64;
 /// pairs land near 0.6–0.65, real edits near 0.71–0.78.
 const MIN_SIMILARITY: f32 = 0.7;
 
-/// The word similarity of `old` and `new`, and the char ranges only each side has.
+/// Word-ratio for pairing; ranges are char-level (VS Code refineDiff + 2/3 word expand).
 fn word_emphasis(old: &str, new: &str) -> (f32, Vec<CharRange>, Vec<CharRange>) {
-    let diff = TextDiff::from_words(old, new);
+    let ratio = TextDiff::from_words(old, new).ratio();
+    let (old_ranges, new_ranges) = char_ranges(old, new);
+    (ratio, finish_ranges(old_ranges, old), finish_ranges(new_ranges, new))
+}
+
+/// The char ranges only each side has, from a character LCS.
+fn char_ranges(old: &str, new: &str) -> (Vec<CharRange>, Vec<CharRange>) {
+    let diff = TextDiff::from_chars(old, new);
     let (mut old_ranges, mut new_ranges) = (Vec::new(), Vec::new());
     let (mut old_pos, mut new_pos) = (0u32, 0u32);
     for change in diff.iter_all_changes() {
@@ -487,9 +510,73 @@ fn word_emphasis(old: &str, new: &str) -> (f32, Vec<CharRange>, Vec<CharRange>) 
             }
         }
     }
-    let old_e = trim_range_edges(coalesce_ws_gaps(old_ranges, old), old);
-    let new_e = trim_range_edges(coalesce_ws_gaps(new_ranges, new), new);
-    (diff.ratio(), old_e, new_e)
+    (old_ranges, new_ranges)
+}
+
+fn finish_ranges(ranges: Vec<CharRange>, text: &str) -> Vec<CharRange> {
+    trim_range_edges(coalesce_ws_gaps(expand_mostly_changed_words(ranges, text), text), text)
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn word_spans(chars: &[char]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_word_char(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i as u32;
+        i += 1;
+        while i < chars.len() && is_word_char(chars[i]) {
+            i += 1;
+        }
+        out.push((start, i as u32));
+    }
+    out
+}
+
+fn range_covers(ranges: &[CharRange], i: u32) -> bool {
+    ranges.iter().any(|&(a, b)| a <= i && i < b)
+}
+
+/// A word whose equal chars are under 2/3 of its length expands to the whole word (VS Code).
+fn expand_mostly_changed_words(ranges: Vec<CharRange>, text: &str) -> Vec<CharRange> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut extra = Vec::new();
+    for (ws, we) in word_spans(&chars) {
+        let len = we - ws;
+        if len == 0 {
+            continue;
+        }
+        let changed = (ws..we).filter(|&i| range_covers(&ranges, i)).count() as u32;
+        let equal = len - changed;
+        let bar = ((2.0 * len as f32) / 3.0).round() as u32;
+        // Short tokens are atomic (`44`→`45`, `Hi`→`Hello`); longer words use VS Code's 2/3 rule.
+        if (len <= 3 && changed > 0) || equal < bar {
+            extra.push((ws, we));
+        }
+    }
+    if extra.is_empty() {
+        return ranges;
+    }
+    let mut merged = ranges;
+    merged.extend(extra);
+    merged.sort_unstable();
+    let mut out: Vec<CharRange> = Vec::new();
+    for (start, end) in merged {
+        match out.last_mut() {
+            Some(last) if last.1 >= start => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
 }
 
 /// Trim whitespace off each range's edges, dropping all-whitespace ranges.
@@ -583,7 +670,7 @@ pub(crate) fn language_of(path: &str) -> Option<String> {
 /// Built `FileDiff`s by content, so an unchanged refresh rebuilds nothing.
 #[derive(Default, Debug)]
 pub struct DiffCache {
-    entries: HashMap<String, (u64, FileDiff)>,
+    entries: HashMap<String, (u64, Arc<FileDiff>)>,
 }
 
 /// The cache clears at this size; only the open file rebuilds.
@@ -602,13 +689,13 @@ impl DiffCache {
         old: &str,
         new: &str,
         hl: &Highlighter,
-    ) -> FileDiff {
+    ) -> Arc<FileDiff> {
         let key = content_hash(previous_path.as_deref(), old, new);
         self.get_or_build(path.clone(), key, || FileDiff::build(path, previous_path, old, new, hl))
     }
 
     /// The File view for `path`, under a `file:` key so it never evicts the path's diff.
-    pub fn get_file(&mut self, path: String, content: &str, hl: &Highlighter) -> FileDiff {
+    pub fn get_file(&mut self, path: String, content: &str, hl: &Highlighter) -> Arc<FileDiff> {
         let key = content_hash(None, content, content);
         self.get_or_build(format!("file:{path}"), key, || FileDiff::build_file(path, content, hl))
     }
@@ -619,17 +706,17 @@ impl DiffCache {
         cache_key: String,
         content_key: u64,
         build: impl FnOnce() -> FileDiff,
-    ) -> FileDiff {
+    ) -> Arc<FileDiff> {
         if let Some((cached, diff)) = self.entries.get(&cache_key)
             && *cached == content_key
         {
-            return diff.clone();
+            return Arc::clone(diff);
         }
-        let diff = build();
+        let diff = Arc::new(build());
         if self.entries.len() >= CACHE_CAP {
             self.entries.clear();
         }
-        self.entries.insert(cache_key, (content_key, diff.clone()));
+        self.entries.insert(cache_key, (content_key, Arc::clone(&diff)));
         diff
     }
 }
@@ -842,15 +929,19 @@ mod tests {
     fn emphasis_pairs_a_deletion_with_its_homolog_not_its_position() {
         // A line inserted above an edit: the edit pairs with its homolog, not the new line.
         let d = build("let total = compute();\n", "// added\nlet total = computeSum();\n");
-        let seg = |row: &Row| -> String {
-            let (a, b) = row.emphasis()[0];
-            row.text().chars().skip(a as usize).take((b - a) as usize).collect()
+        let covers = |row: &Row, needle: &str| {
+            let text = row.text();
+            row.emphasis().iter().any(|&(a, b)| {
+                let seg: String = text.chars().skip(a as usize).take((b - a) as usize).collect();
+                seg.contains(needle)
+            })
         };
         let del = d.rows.iter().find(|r| matches!(r, Row::Deletion { .. })).unwrap();
         let comment = d.rows.iter().find(|r| r.text() == "// added").unwrap();
         let edited = d.rows.iter().find(|r| r.text() == "let total = computeSum();").unwrap();
-        assert_eq!(seg(del), "compute();", "the deletion emphasizes its real edit");
-        assert_eq!(seg(edited), "computeSum();", "its homolog insertion is the one emphasized");
+        assert!(del.emphasis().is_empty(), "the old line is a prefix, so it stays plain");
+        assert!(covers(edited, "Sum"), "only the inserted token is emphasized");
+        assert!(!covers(edited, "let"), "the shared binding stays plain");
         assert!(comment.emphasis().is_empty(), "the unrelated inserted line stays plain");
     }
 
@@ -867,34 +958,79 @@ mod tests {
 
     #[test]
     fn a_reformat_or_unrelated_pair_is_not_emphasized() {
-        // A reformat and two `let`s sharing a skeleton stay below the bar, unemphasized.
+        // A one-to-many reformat stays unpaired (unequal counts, below the bar).
         let reformat = build(
             "    rows.push(Row::Deletion { old_no: oi + 1, spans: s });\n",
             "    rows.push(Row::Deletion {\n        old_no: oi + 1,\n        spans: s,\n    });\n",
         );
+        assert!(
+            reformat.rows.iter().all(|r| r.emphasis().is_empty()),
+            "no inline emphasis on a one-to-many reformat"
+        );
+        // Same-length `let`s now refine; shared `let` stays plain.
         let unrelated = build(
             "    let start = scroll.min(len.sub(height));\n",
             "    let target = (row - inner.y) as usize;\n",
         );
-        for d in [reformat, unrelated] {
-            assert!(
-                d.rows.iter().all(|r| r.emphasis().is_empty()),
-                "no inline emphasis on a sub-threshold pair"
-            );
-        }
+        let del = unrelated.rows.iter().find(|r| matches!(r, Row::Deletion { .. })).unwrap();
+        let ins = unrelated.rows.iter().find(|r| matches!(r, Row::Insertion { .. })).unwrap();
+        let overlaps = |row: &Row, needle: &str| {
+            let text = row.text();
+            let start = text.find(needle).expect(needle);
+            let a = text[..start].chars().count() as u32;
+            let b = a + needle.chars().count() as u32;
+            row.emphasis().iter().any(|&(s, e)| s < b && e > a)
+        };
+        assert!(overlaps(del, "start"), "the old name is emphasized");
+        assert!(overlaps(ins, "target"), "the new name is emphasized");
+        assert!(!overlaps(del, "let"), "the shared binding stays plain");
     }
 
     #[test]
-    fn a_wholesale_line_rewrite_gets_no_word_emphasis() {
-        // Two unrelated lines sharing only `///` and punctuation stay unemphasized.
+    fn a_wholesale_line_rewrite_still_emphasizes_the_changed_words() {
+        // Same-length rewrite: shared `///` stays plain; the rest is the edit.
         let d = build(
             "/// Keep diff_scroll so the cursor stays within the viewport\n",
             "/// Scroll the diff horizontally by delta columns\n",
         );
         let del = d.rows.iter().find(|r| matches!(r, Row::Deletion { .. })).unwrap();
         let ins = d.rows.iter().find(|r| matches!(r, Row::Insertion { .. })).unwrap();
-        assert!(del.emphasis().is_empty(), "dissimilar deletion is not emphasized");
-        assert!(ins.emphasis().is_empty(), "dissimilar insertion is not emphasized");
+        let overlaps = |row: &Row, needle: &str| {
+            let text = row.text();
+            let start = text.find(needle).expect(needle);
+            let a = text[..start].chars().count() as u32;
+            let b = a + needle.chars().count() as u32;
+            row.emphasis().iter().any(|&(s, e)| s < b && e > a)
+        };
+        assert!(overlaps(del, "Keep"), "the old wording is emphasized");
+        assert!(overlaps(ins, "horizontally"), "the new wording is emphasized");
+        assert!(!overlaps(del, "///"), "the shared marker stays plain");
+    }
+
+    #[test]
+    fn an_equal_count_grown_line_still_emphasizes_the_edit() {
+        // Same line count, word ratio ~0.66 (below MIN_SIMILARITY): still a line edit.
+        let old =
+            "| `src/keymap.rs` | `ACTIONS` 44→45；`scope-unstaged` 默认 `U`（不是 `Ctrl+u`） |\n";
+        let new = "| `src/keymap.rs` | `ACTIONS` 45→46；`scope-unstaged` 默认 `u`，`scope-uncommitted` 默认 `U`（都不是 `Ctrl+u`）；`stage-file` 默认 `a` |\n";
+        let d = build(old, new);
+        let del = d.rows.iter().find(|r| matches!(r, Row::Deletion { .. })).unwrap();
+        let ins = d.rows.iter().find(|r| matches!(r, Row::Insertion { .. })).unwrap();
+        let overlaps = |row: &Row, needle: &str| {
+            let text = row.text();
+            let start = text.find(needle).expect(needle);
+            let a = text[..start].chars().count() as u32;
+            let b = a + needle.chars().count() as u32;
+            row.emphasis().iter().any(|&(s, e)| s < b && e > a)
+        };
+        assert!(overlaps(del, "44"), "the old number is emphasized");
+        assert!(overlaps(ins, "46"), "the new number is emphasized");
+        assert!(overlaps(ins, "stage-file"), "the added token is emphasized");
+        assert!(!overlaps(del, "keymap"), "the shared path stays plain");
+        assert!(!overlaps(ins, "scope-unstaged"), "a shared token stays plain");
+        let covered: u32 = ins.emphasis().iter().map(|&(a, b)| b - a).sum();
+        let len = ins.text().chars().count() as u32;
+        assert!(covered < len / 2, "shared tokens stay light, not one whole-line blob");
     }
 
     #[test]

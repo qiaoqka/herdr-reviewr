@@ -11,6 +11,26 @@
 
 # herdr-reviewr
 
+> **Fork overlay** of [persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr)
+> on branch `unstaged-scope`, published as [qiaoqka/herdr-reviewr](https://github.com/qiaoqka/herdr-reviewr).
+> Pin to upstream release tags (`v0.46.0` now); do not follow `upstream/main` between
+> releases. Body below is upstream and is not rewritten. Install the upstream plugin with
+> `herdr plugin install persiyanov/herdr-reviewr`. This tree: `cargo build --release`, then
+> `herdr plugin link` the clone.
+>
+> - Fifth scope **unstaged** (`u`): working tree vs the index, plus untracked. Fully staged
+>   files drop out of Changes.
+> - **uncommitted** default key is `U`. **last turn** stays `t`.
+> - **stage-file** (`a`): `git add` the open file on Unstaged or last-turn, only when it
+>   still has unstaged or untracked work. The only real-index write.
+> - Scope picker hangs from the scope chip.
+> - Intra-line emphasis: equal-count replace always refines; ranges are char-level (VS Code
+>   refineDiff + 2/3 word expand).
+> - `DiffCache` stores `Arc<FileDiff>` and is not wiped on `u`/`U`. First open of a large
+>   file still highlights both sides on the keystroke.
+> - A new turn (rest→work) publishes its start snapshot immediately, so last-turn empties
+>   until that turn writes. A question-only turn does not keep the previous turn's files.
+
 [![CI](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml/badge.svg)](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/persiyanov/herdr-reviewr)](https://github.com/persiyanov/herdr-reviewr/releases/latest)
 [![License](https://img.shields.io/github/license/persiyanov/herdr-reviewr)](LICENSE)

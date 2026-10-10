@@ -4,12 +4,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::app::Tab;
 use crate::file_list::Entry;
 use crate::git;
-use crate::model::{ChangeKind, ChangedFile, CommitPick, Scope};
+use crate::model::{ChangeKind, ChangedFile, CommitPick, DiffBase, Scope};
 
 /// Everything the build reads; a snapshot lands only while the view still matches it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -66,7 +66,7 @@ pub struct PickStatus {
 /// The ends a changeset was diffed between (`new` `None` for the worktree); a file's diff reads these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffEnds {
-    pub old: String,
+    pub old: DiffBase,
     pub new: Option<String>,
 }
 
@@ -125,13 +125,13 @@ fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
         Scope::LastTurn => match input.turn_baseline.as_deref() {
             Some(t) => {
                 let now = git::snapshot_worktree(&input.repo)?;
-                at_ends(&input.repo, DiffEnds { old: t.to_string(), new: Some(now) })
+                at_ends(&input.repo, DiffEnds { old: DiffBase::from(t), new: Some(now) })
             }
             None => Ok(ScopeBuild::default()),
         },
         Scope::Uncommitted => {
             let base = git::diff_base(head);
-            at_ends(&input.repo, DiffEnds { old: base, new: None })
+            at_ends(&input.repo, DiffEnds { old: DiffBase::from(base), new: None })
         }
         Scope::Branch => {
             // A resolve failure fails the build, keeping the stale frame.
@@ -142,7 +142,9 @@ fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
                 .as_ref()
                 .and_then(|w| git::merge_base(&input.repo, w.oid()));
             let build = match merge_base {
-                Some(base) => at_ends(&input.repo, DiffEnds { old: base, new: None })?,
+                Some(base) => {
+                    at_ends(&input.repo, DiffEnds { old: DiffBase::from(base), new: None })?
+                }
                 None => ScopeBuild::default(),
             };
             Ok(ScopeBuild { branch_base: resolution.status, ..build })
@@ -152,14 +154,17 @@ fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
             let Some(pick) = &input.commit_pick else { return Ok(ScopeBuild::default()) };
             build_pick(&input.repo, pick)
         }
+        Scope::Unstaged => at_ends(&input.repo, DiffEnds { old: DiffBase::Index, new: None }),
     }
 }
 
 /// The changeset between `ends`, carried beside them: the ends a file's diff reads are its input.
 fn at_ends(repo: &Path, ends: DiffEnds) -> Result<ScopeBuild> {
-    let changed = match &ends.new {
-        None => git::changed_from(repo, &ends.old)?,
-        Some(new) => git::changed_between(repo, &ends.old, new)?,
+    let changed = match (&ends.old, ends.new.as_deref()) {
+        (DiffBase::Index, None) => git::changed_from(repo, DiffBase::Index)?,
+        (DiffBase::Revision(_), None) => git::changed_from(repo, ends.old.clone())?,
+        (DiffBase::Revision(old), Some(new)) => git::changed_between(repo, old, new)?,
+        (DiffBase::Index, Some(_)) => bail!("index diff base is worktree-only"),
     };
     let files = changed.into_iter().map(|f| (f.path.clone(), f)).collect();
     Ok(ScopeBuild { changeset: Changeset { files, ends: Some(ends) }, ..ScopeBuild::default() })
@@ -186,7 +191,7 @@ fn build_pick(repo: &Path, pick: &CommitPick) -> Result<ScopeBuild> {
     }
     let subject = git::commit_subject(repo, &pick.newest).unwrap_or_default();
     let count = git::run_length_from(repo, &old, &pick.oldest, &pick.newest).unwrap_or(0);
-    let at = at_ends(repo, DiffEnds { old, new: Some(pick.newest.clone()) })?;
+    let at = at_ends(repo, DiffEnds { old: DiffBase::from(old), new: Some(pick.newest.clone()) })?;
     // The oldest is an ancestor of the newest, so one reachability check covers the run.
     let verdict = if git::is_reachable(repo, &pick.newest) {
         PickVerdict::Live
@@ -286,16 +291,26 @@ fn read_paths(
         // The pick reads committed trees: a worktree batch changes nothing in it.
         (None, _) | (_, Scope::Commits) => Ok((Vec::new(), ends)),
         (Some(DiffEnds { old, new: None }), _) => {
-            git::changed_from_in(&input.repo, old, &batch).map(|files| (files, ends.clone()))
+            git::changed_from_in(&input.repo, old.clone(), &batch)
+                .map(|files| (files, ends.clone()))
         }
         // The new end is last's tree with `paths` re-read, which a full snapshot would equal.
-        (Some(DiffEnds { old, new: Some(new) }), _) => {
+        (Some(DiffEnds { old: DiffBase::Revision(old), new: Some(new) }), _) => {
             match git::snapshot_worktree_in(&input.repo, new, &batch) {
                 Ok(None) => return None,
-                Ok(Some(tree)) => git::changed_between_in(&input.repo, old, &tree, &batch)
-                    .map(|files| (files, Some(DiffEnds { old: old.clone(), new: Some(tree) }))),
+                Ok(Some(tree)) => {
+                    git::changed_between_in(&input.repo, old, &tree, &batch).map(|files| {
+                        (
+                            files,
+                            Some(DiffEnds { old: DiffBase::from(old.clone()), new: Some(tree) }),
+                        )
+                    })
+                }
                 Err(e) => Err(e),
             }
+        }
+        (Some(DiffEnds { old: DiffBase::Index, new: Some(_) }), _) => {
+            Err(anyhow::anyhow!("index diff base is worktree-only"))
         }
     };
     Some(read)

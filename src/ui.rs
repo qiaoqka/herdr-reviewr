@@ -110,6 +110,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::Picker => Some(render_agent_picker),
         Mode::BasePick => Some(render_base_picker),
         Mode::CommitPick => Some(render_commit_picker),
+        Mode::ScopePick => Some(render_scope_picker),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
     };
     if let Some(render_popup) = popup {
@@ -2650,6 +2651,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::ClearSelection => ("esc".into(), "clear"),
         A::EditComment => (hint(K::Edit), "edit"),
         A::EditFile => (hint(K::Edit), "edit file"),
+        A::StageFile => (hint(K::StageFile), "stage"),
         A::DeleteComment => (hint(K::Delete), "delete"),
         A::JumpComment => (format!("{}/{}", hint(K::NextComment), hint(K::PrevComment)), "jump"),
         A::ExpandFold => (hint(K::Expand), "expand fold"),
@@ -2674,11 +2676,12 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         }
         A::Scope => (
             format!(
-                "{}/{}/{}/{}",
+                "{}/{}/{}/{}/{}",
                 hint(K::ScopeUncommitted),
                 hint(K::ScopeBranch),
                 hint(K::ScopeLastTurn),
-                hint(K::ScopeCommits)
+                hint(K::ScopeCommits),
+                hint(K::ScopeUnstaged)
             ),
             "scope",
         ),
@@ -2691,7 +2694,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         }
         A::Save => ("enter".into(), "save"),
         A::Newline => ("shift+enter".into(), "newline"),
-        A::Cancel | A::ClosePicker => ("esc".into(), "cancel"),
+        A::Cancel | A::ClosePicker | A::CloseScopePicker => ("esc".into(), "cancel"),
         A::CloseList | A::CloseSearch | A::CloseFind => ("esc".into(), "close"),
         A::PickAgent => ("enter".into(), "send"),
         // The digits are literal; the movement keys are bound.
@@ -2702,7 +2705,9 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
             let n = app.commit_picker.as_ref().map_or(0, crate::app::CommitPicker::run_len);
             return ("enter".into(), if n > 1 { format!("open {n}") } else { "open".into() });
         }
-        A::MoveCommitRow => (format!("{} {}", hint(K::Down), hint(K::Up)), "move"),
+        A::MoveCommitRow | A::MoveScopeRow => {
+            (format!("{} {}", hint(K::Down), hint(K::Up)), "move")
+        }
         A::CloseCommitPicker => {
             let anchored = app.commit_picker.as_ref().is_some_and(|cp| cp.anchor.is_some());
             ("esc".into(), if anchored { "clear" } else { "cancel" })
@@ -2714,6 +2719,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
                 (Scope::Branch, K::ScopeBranch),
                 (Scope::LastTurn, K::ScopeLastTurn),
                 (Scope::Commits, K::ScopeCommits),
+                (Scope::Unstaged, K::ScopeUnstaged),
             ]
             .into_iter()
             .filter(|(scope, _)| app.scope != *scope)
@@ -2734,8 +2740,8 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
                 app.search.as_ref().is_none_or(|s| s.search_mode == crate::app::SearchMode::Files);
             return ("tab".into(), if to_code { "code" } else { "files" }.into());
         }
-        // `enter` opens the highlight in every list: a search result, a base, a commit run.
-        A::OpenResult | A::PickBaseRow => ("enter".into(), "open"),
+        // `enter` opens the highlight in every list: a search result, a base, a commit run, a scope.
+        A::OpenResult | A::PickBaseRow | A::PickScope => ("enter".into(), "open"),
         A::OpenPr => (hint(K::OpenPr), "open ↗"),
         A::Refresh => (hint(K::Refresh), "refresh"),
         A::Tabs => {
@@ -3542,6 +3548,71 @@ fn render_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
         ))));
     }
     frame.render_widget(List::new(items), inner);
+}
+
+/// The header scope chip, same columns `hit_header` uses.
+fn scope_chip_rect(area: Rect, app: &App) -> Rect {
+    let tab = panes(area, app).tab;
+    let prefix = header_prefix_len(&tab_spans(app.keymap(), app.pr_forge)) as u16;
+    let width = scope_chip(app).width() as u16;
+    Rect { x: tab.x.saturating_add(prefix), y: tab.y, width, height: tab.height.max(1) }
+}
+
+/// Menu under the scope chip: top edge on the chip's bottom, centered on the chip, in the body.
+fn scope_picker_popup(area: Rect, app: &App) -> Rect {
+    let widest = crate::app::SCOPE_PICK_ROWS
+        .iter()
+        .map(|scope| 2 + scope.label().width())
+        .max()
+        .unwrap_or(0);
+    let body = panes(area, app).body;
+    let title = framed_title("scope").width() + 2;
+    let w = (widest + 3).max(title).max(PICKER_MIN_WIDTH).min(body.width as usize) as u16;
+    let chip = scope_chip_rect(area, app);
+    let y = chip.y.saturating_add(chip.height);
+    let remaining = body.y.saturating_add(body.height).saturating_sub(y);
+    let h = (crate::app::SCOPE_PICK_ROWS.len() + 2).min(remaining as usize) as u16;
+    let mid = chip.x + chip.width / 2;
+    let x = mid.saturating_sub(w / 2);
+    let max_x = body.x + body.width.saturating_sub(w);
+    Rect { x: x.clamp(body.x, max_x), y, width: w, height: h }
+}
+
+fn render_scope_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(sp) = &app.scope_picker else { return };
+    let p = app.palette();
+    let popup = scope_picker_popup(area, app);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.mark(Ink::Accent, Fill::Base)))
+        .title(framed_title("scope"));
+    let inner = picker_inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height == 0 {
+        return;
+    }
+    let width = inner.width as usize;
+    let items: Vec<ListItem> = crate::app::SCOPE_PICK_ROWS
+        .iter()
+        .enumerate()
+        .map(|(i, scope)| {
+            let on = cursor_fill(i == sp.cursor);
+            let mark = if *scope == app.scope { "· " } else { "  " };
+            let spans = vec![
+                Span::styled(mark, Style::default().fg(p.mark(Ink::Accent, on))),
+                Span::styled(scope.label().to_string(), text_style(p, on)),
+            ];
+            selectable_row(p, spans, width, on)
+        })
+        .collect();
+    frame.render_widget(List::new(items), inner);
+}
+
+/// The scope-picker row under the pointer.
+pub fn hit_scope_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Option<usize> {
+    let inner = picker_inner(scope_picker_popup(area, app));
+    menu_hit(inner, 0, 0, crate::app::SCOPE_PICK_ROWS.len(), col, row)
 }
 
 /// The commit-picker row under the pointer.

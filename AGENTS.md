@@ -1,3 +1,33 @@
+# FORK-DELTA
+
+This checkout overlays [persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr)
+on branch `unstaged-scope`, published as
+[qiaoqka/herdr-reviewr](https://github.com/qiaoqka/herdr-reviewr). Pin to upstream **release
+tags** (`v0.46.0` now). Do not rebase onto `upstream/main` between releases. When a new tag
+ships: `git fetch upstream --tags && git rebase v0.47.0` (or merge). Read this block first.
+The rest is upstream guidance unless a line below replaces it.
+
+Replaces **No writes**: refresh, changeset, and snapshot still never write the real index
+(private refs, `IndexCopy`, `diff.autoRefreshIndex=false`). The one real-index write is the
+user-initiated `stage-file` action (`git add` of the open file).
+
+- **Scope::Unstaged** (`u`) — `DiffBase::Index` plus untracked. Changes omits fully staged
+  files. **Uncommitted** default key is `U`. Architecture scopes are
+  `Unstaged` / `Uncommitted` / `Branch` / `LastTurn` / `Commits`.
+- **stage-file** (`a`) — Unstaged or LastTurn + Changes. Stages only when the open file has
+  an unstaged edit or is untracked; already staged or committed-clean is inert
+  (`nothing to stage`).
+- Scope picker hangs from the scope chip.
+- Intra-line emphasis: equal-count replace always refines; char-level ranges (VS Code
+  refineDiff + 2/3 word expand). `DiffCache` stores `Arc<FileDiff>` and stays across scope
+  switch (content-hashed); theme change still wipes it.
+- A new turn publishes its start snapshot immediately, so last-turn empties until
+  that turn writes. A question-only turn does not keep the previous turn's files.
+- Do not change the machine `default_scope`. Keep `last-turn` unless the human asks.
+- `reload()` on a Changes-tab scope switch is still synchronous.
+
+---
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. AGENTS.md is the primary file. CLAUDE.md is a symlink to it.

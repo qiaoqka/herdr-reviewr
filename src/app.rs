@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -89,7 +90,7 @@ struct TabStash {
     file_cursor: usize,
     file_scroll: usize,
     toggled_dirs: HashSet<String>,
-    diff: FileDiff,
+    diff: Arc<FileDiff>,
     visible: Vec<Row>,
     expanded_folds: HashSet<u32>,
     diff_path: Option<String>,
@@ -307,6 +308,29 @@ impl CommitPicker {
     }
 }
 
+/// The five scopes the chip picker lists, in header order.
+pub const SCOPE_PICK_ROWS: [Scope; 5] =
+    [Scope::Uncommitted, Scope::Branch, Scope::LastTurn, Scope::Commits, Scope::Unstaged];
+
+/// The chip picker's highlight while [`Mode::ScopePick`] is open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopePicker {
+    pub cursor: usize,
+}
+
+impl ScopePicker {
+    fn open_on(scope: Scope) -> Self {
+        let cursor = SCOPE_PICK_ROWS.iter().position(|&row| row == scope).unwrap_or(0);
+        Self { cursor }
+    }
+
+    /// The highlighted scope.
+    #[must_use]
+    pub fn selected(&self) -> Scope {
+        SCOPE_PICK_ROWS[self.cursor.min(SCOPE_PICK_ROWS.len() - 1)]
+    }
+}
+
 /// The interaction mode the UI is in.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -323,6 +347,8 @@ pub enum Mode {
     BasePick,
     /// Choosing the `commits` scope's pick.
     CommitPick,
+    /// Choosing which scope the Changes list shows.
+    ScopePick,
     /// The search screen, replacing the body.
     Search,
     /// The read pane's foot band: find in the file, or a line to jump to.
@@ -334,7 +360,12 @@ impl Mode {
     pub fn is_modal(&self) -> bool {
         matches!(
             self,
-            Mode::Composing { .. } | Mode::List | Mode::Picker | Mode::BasePick | Mode::CommitPick
+            Mode::Composing { .. }
+                | Mode::List
+                | Mode::Picker
+                | Mode::BasePick
+                | Mode::CommitPick
+                | Mode::ScopePick
         )
     }
 }
@@ -363,7 +394,7 @@ pub enum SearchPhase {
 #[derive(Debug)]
 pub struct SearchPreview {
     pub path: String,
-    pub diff: crate::diff::FileDiff,
+    pub diff: Arc<crate::diff::FileDiff>,
     /// A `Code` pick's line and matched byte spans.
     pub hit: Option<(u64, Vec<(u32, u32)>)>,
     /// Top visible row, centered on the hit once per build.
@@ -490,6 +521,8 @@ pub enum FooterAction {
     ClearSelection,
     EditComment,
     EditFile,
+    /// Stage the open file; offered only in Unstaged.
+    StageFile,
     DeleteComment,
     JumpComment,
     ExpandFold,
@@ -554,6 +587,10 @@ pub enum FooterAction {
     MoveCommitRow,
     CommitAnchor,
     CloseCommitPicker,
+    /// The scope picker's bar.
+    PickScope,
+    MoveScopeRow,
+    CloseScopePicker,
     /// The scopes other than the one showing.
     ScopeOther,
     OpenPr,
@@ -605,6 +642,8 @@ pub struct App {
     pub pick_status: Option<PickStatus>,
     /// The commit picker's rows, highlight, and anchor while `Mode::CommitPick` is open
     pub commit_picker: Option<CommitPicker>,
+    /// The chip picker's highlight while `Mode::ScopePick` is open.
+    pub scope_picker: Option<ScopePicker>,
     /// Bumped by each pick here, so a build of the old pick never lands.
     base_epoch: u64,
     pub scope: Scope,
@@ -636,7 +675,7 @@ pub struct App {
     stash: TabStash,
     /// The active scope's changed files and the ends they were diffed between, on every tab.
     changeset: Changeset,
-    pub diff: FileDiff,
+    pub diff: Arc<FileDiff>,
     /// `diff.rows` with folds applied: what the cursor and hit tests index.
     pub visible: Vec<Row>,
     /// Fold anchors (first-hidden-line numbers) currently expanded; survives a refresh.
@@ -836,6 +875,7 @@ impl App {
             commit_pick: None,
             pick_status: None,
             commit_picker: None,
+            scope_picker: None,
             base_epoch: 0,
             scope,
             tab: Tab::Changes,
@@ -853,7 +893,7 @@ impl App {
             toggled_dirs: HashSet::new(),
             stash: TabStash::default(),
             changeset: Changeset::default(),
-            diff: FileDiff::empty(),
+            diff: Arc::new(FileDiff::empty()),
             visible: Vec::new(),
             expanded_folds: HashSet::new(),
             diff_path: None,
@@ -1030,7 +1070,11 @@ impl App {
         match old_mode {
             // `set_config_error` already closed these.
             Mode::Normal | Mode::Search | Mode::Find | Mode::Picker => {}
-            Mode::List | Mode::Composing { .. } | Mode::BasePick | Mode::CommitPick => {
+            Mode::List
+            | Mode::Composing { .. }
+            | Mode::BasePick
+            | Mode::CommitPick
+            | Mode::ScopePick => {
                 self.scope = old.scope;
                 self.tab = old.tab;
                 self.active_file_tab = old.active_file_tab;
@@ -1069,6 +1113,7 @@ impl App {
                 self.base_picker = old.base_picker.take();
                 // So does the commit picker, with its highlight and anchor.
                 self.commit_picker = old.commit_picker.take();
+                self.scope_picker = old.scope_picker.take();
             }
         }
     }
@@ -1296,7 +1341,7 @@ impl App {
 
     /// Show no file: no diff, rows, render, or marks.
     fn clear_open_view(&mut self) {
-        self.diff = FileDiff::empty();
+        self.diff = Arc::new(FileDiff::empty());
         self.diff_path = None;
         self.rendered.clear();
         self.visible.clear();
@@ -1342,7 +1387,7 @@ impl App {
                 (old, new)
             }
             Err(notice) => {
-                self.diff = FileDiff::notice(path, previous_path, notice, View::Diff);
+                self.diff = Arc::new(FileDiff::notice(path, previous_path, notice, View::Diff));
                 (String::new(), String::new())
             }
         };
@@ -1371,14 +1416,14 @@ impl App {
     }
 
     /// The File view for `path`: the too-large notice unread, else the highlighted worktree content.
-    fn file_view(&mut self, path: &str) -> (FileDiff, String) {
+    fn file_view(&mut self, path: &str) -> (Arc<FileDiff>, String) {
         match worktree_content(&self.repo, path) {
             Ok(content) => {
                 let diff = self.cache.get_file(path.to_string(), &content, &self.highlighter);
                 (diff, content)
             }
             Err(notice) => {
-                (FileDiff::notice(path.to_string(), None, notice, View::File), String::new())
+                (Arc::new(FileDiff::notice(path.to_string(), None, notice, View::File)), String::new())
             }
         }
     }
@@ -1741,7 +1786,7 @@ impl App {
             return Err(Notice::TooLarge);
         }
         let source = annotation.previous_path.as_deref();
-        match git::diff_sides(&self.repo, &ends.old, ends.new.as_deref(), path, source) {
+        match git::diff_sides(&self.repo, ends.old.clone(), ends.new.as_deref(), path, source) {
             Ok(git::DiffSides::Text { old, new }) => Ok((old, new)),
             Ok(git::DiffSides::Binary) => Err(Notice::Binary),
             Err(error) => {
@@ -2465,15 +2510,6 @@ impl App {
         self.diff_scroll = self.diff_scroll.min(max_top);
     }
 
-    /// The chip click's next scope, skipping `commits` without a live pick.
-    pub fn next_chip_scope(&self) -> Scope {
-        let next = self.scope.cycle();
-        if next == Scope::Commits && (self.commit_pick.is_none() || self.pick_gone()) {
-            return next.cycle();
-        }
-        next
-    }
-
     /// Switch the scope and reload; inert while composing.
     pub fn set_scope(&mut self, scope: Scope) -> Result<()> {
         self.ensure_config_ready()?;
@@ -2494,9 +2530,33 @@ impl App {
         Ok(())
     }
 
+    /// Stage the open file in the real index. Unstaged or LastTurn + Changes; otherwise inert.
+    pub fn stage_current_file(&mut self) -> Result<()> {
+        self.ensure_config_ready()?;
+        if self.composing() || self.tab != Tab::Changes || !self.scope_offers_stage() {
+            return Ok(());
+        }
+        let Some(path) = self.diff_path.clone() else {
+            return Ok(());
+        };
+        if !git::path_has_unstaged(&self.repo, &path)? {
+            self.status = "nothing to stage".to_string();
+            return Ok(());
+        }
+        git::stage_path(&self.repo, &path)?;
+        self.reload()?;
+        Ok(())
+    }
+
+    fn scope_offers_stage(&self) -> bool {
+        matches!(self.scope, Scope::Unstaged | Scope::LastTurn)
+    }
+
     /// After the base moved, reset `Changes` to the top wherever it lives; `All files` keeps its place.
     fn rebase_changes(&mut self) -> Result<()> {
-        self.cache = DiffCache::new();
+        // Keep DiffCache: it is keyed by both sides. A file that is only unstaged has the
+        // same old+new under Unstaged and Uncommitted, so wiping forced a full FileDiff
+        // rebuild of the open file on every u/U.
         if self.tab == Tab::Changes {
             self.file_cursor = 0;
             self.expanded_folds.clear();
@@ -3431,7 +3491,7 @@ impl App {
             Mode::Search => self.search.as_mut().map(|s| (&mut s.query, &mut s.caret)),
             Mode::Find => self.find.as_mut().map(|f| (&mut f.query, &mut f.caret)),
             Mode::BasePick => self.base_picker.as_mut().map(|b| (&mut b.query, &mut b.caret)),
-            Mode::Normal | Mode::List | Mode::Picker | Mode::CommitPick => None,
+            Mode::Normal | Mode::List | Mode::Picker | Mode::CommitPick | Mode::ScopePick => None,
         }
     }
 
@@ -3787,6 +3847,7 @@ impl App {
             | Mode::Picker
             | Mode::BasePick
             | Mode::CommitPick
+            | Mode::ScopePick
             | Mode::Search
             | Mode::Find => None,
         }
@@ -4442,6 +4503,13 @@ impl App {
                 }
                 return out;
             }
+            Mode::ScopePick => {
+                return vec![
+                    (A::PickScope, Primary),
+                    (A::CloseScopePicker, Do),
+                    (A::MoveScopeRow, Do),
+                ];
+            }
             Mode::Search => {
                 // Nothing pickable: only the flip and the exit.
                 let pickable = self
@@ -4563,6 +4631,18 @@ impl App {
                 .position(|&(a, band)| band == Do && a == A::NavigatorHide)
                 .unwrap_or(out.len());
             out.insert(at, (A::EditFile, Do));
+        }
+
+        if self.scope_offers_stage()
+            && self.tab == Tab::Changes
+            && self.diff_path.as_deref().is_some_and(|p| self.entries.iter().any(|e| e.path == p))
+        {
+            let at = out
+                .iter()
+                .position(|&(a, band)| band == Do && a == A::EditFile)
+                .map(|i| i + 1)
+                .unwrap_or(out.len());
+            out.insert(at, (A::StageFile, Do));
         }
 
         // An armed crossing leads, so the reviewer sees the next press leaves the file.
@@ -4821,6 +4901,47 @@ impl App {
         self.rebase_changes()?;
         self.reveal_files = true;
         Ok(())
+    }
+
+    /// Open the scope picker on the current scope.
+    pub fn open_scope_picker(&mut self) {
+        if !self.tab.is_file_tab() || self.mode != Mode::Normal {
+            return;
+        }
+        self.scope_picker = Some(ScopePicker::open_on(self.scope));
+        self.mode = Mode::ScopePick;
+    }
+
+    /// Close the scope picker; the scope stays.
+    pub fn close_scope_picker(&mut self) {
+        if self.mode == Mode::ScopePick {
+            self.mode = Mode::Normal;
+        }
+        self.scope_picker = None;
+    }
+
+    /// Move the highlight, clamped at the ends.
+    pub fn scope_picker_move(&mut self, delta: isize) {
+        let Some(sp) = self.scope_picker.as_mut() else { return };
+        sp.cursor = step(sp.cursor, delta, SCOPE_PICK_ROWS.len());
+    }
+
+    /// Move the highlight to `row`, for a click. A row past the end is inert.
+    pub fn scope_picker_goto(&mut self, row: usize) {
+        if let Some(sp) = self.scope_picker.as_mut()
+            && row < SCOPE_PICK_ROWS.len()
+        {
+            sp.cursor = row;
+        }
+    }
+
+    /// `enter`: close, then switch to the highlight. `commits` without a live pick opens `CommitPick`.
+    pub fn scope_picker_pick(&mut self) -> Result<()> {
+        let Some(scope) = self.scope_picker.as_ref().map(ScopePicker::selected) else {
+            return Ok(());
+        };
+        self.close_scope_picker();
+        self.set_scope(scope)
     }
 
     /// Open the commit picker with the current pick highlighted and anchored.
@@ -5577,6 +5698,24 @@ mod tests {
     }
 
     #[test]
+    fn config_recovery_carries_the_scope_picker_highlight() {
+        let mut old = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
+        old.mode = Mode::ScopePick;
+        old.scope_picker = Some(super::ScopePicker::open_on(Scope::Unstaged));
+        old.scope_picker.as_mut().unwrap().cursor =
+            super::SCOPE_PICK_ROWS.iter().position(|s| *s == Scope::Unstaged).unwrap();
+
+        let mut recovered = App::new(PathBuf::from("."), Scope::LastTurn, None);
+        recovered.carry_authored_state_from(&mut old);
+        assert_eq!(recovered.mode, Mode::ScopePick);
+        assert_eq!(recovered.scope, Scope::Uncommitted);
+        assert_eq!(
+            recovered.scope_picker.as_ref().map(super::ScopePicker::selected),
+            Some(Scope::Unstaged)
+        );
+    }
+
+    #[test]
     fn config_recovery_carries_the_footer_expansion() {
         // The `?` expansion is one global toggle, carried whatever mode recovery finds.
         let mut old = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
@@ -6074,7 +6213,10 @@ mod tests {
         let mut app = App::new(repo.to_path_buf(), Scope::Uncommitted, None);
         app.reload().unwrap();
         // The landed ends name a commit git no longer has.
-        app.changeset.ends = Some(crate::world::DiffEnds { old: "0".repeat(40), new: None });
+        app.changeset.ends = Some(crate::world::DiffEnds {
+            old: crate::model::DiffBase::from("0".repeat(40)),
+            new: None,
+        });
         app.set_diff("a.txt".to_string());
         assert_eq!(app.diff.notice, Some(crate::diff::Notice::Unreadable));
         assert!(app.diff.rows.is_empty());
