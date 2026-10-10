@@ -4981,3 +4981,75 @@ fn the_line_field_paints_its_number_count_and_footer() {
     let hl = app.palette().fill(Fill::Highlight);
     assert!(!render_buffer(&app).content.iter().any(|c| c.bg == hl), "no find highlight");
 }
+
+#[test]
+fn diff_overview_colors_adds_and_deletes_and_marks_the_thumb() {
+    use herdr_reviewr::diff::Row;
+    use herdr_reviewr::ui::{OverviewKind, diff_overview};
+
+    let ins = || Row::Insertion { new_no: 1, spans: vec![], emphasis: vec![], cr: false };
+    let del = || Row::Deletion { old_no: 1, spans: vec![], emphasis: vec![], cr: false };
+    let ctx = || Row::Context { old_no: 1, new_no: 1, spans: vec![] };
+    let rows: Vec<Row> = std::iter::repeat_with(ins)
+        .take(3)
+        .chain(std::iter::repeat_with(ctx).take(7))
+        .chain(std::iter::repeat_with(del).take(3))
+        .collect();
+    let heights = vec![1; rows.len()];
+    let cells = diff_overview(&rows, &heights, 0, 4, 13);
+    assert_eq!(cells.len(), 13);
+    assert!(cells[..3].iter().all(|c| c.kind == OverviewKind::Added && c.thumb));
+    assert!(cells[3].thumb && cells[4].thumb == false);
+    assert!(cells[3..10].iter().all(|c| c.kind == OverviewKind::None));
+    assert!(cells[10..].iter().all(|c| c.kind == OverviewKind::Removed && !c.thumb));
+}
+
+#[test]
+fn a_short_diff_paints_no_overview_thumb() {
+    let app = edited_app();
+    assert!(app.visible.len() < 20, "the fixture must fit the pane");
+    let out = render(&app);
+    assert!(!out.contains('┃'), "a fitting diff paints no thumb:\n{out}");
+}
+
+#[test]
+fn an_overflowing_diff_paints_change_colors_on_the_overview() {
+    let r = Repo::init();
+    let old: String = (1..=40)
+        .map(|i| format!("keep {i}\n"))
+        .chain((1..=40).map(|i| format!("gone {i}\n")))
+        .collect();
+    let new: String = (1..=40)
+        .map(|i| format!("new {i}\n"))
+        .chain((1..=40).map(|i| format!("keep {i}\n")))
+        .collect();
+    r.write("big.rs", &old);
+    r.commit_all("init");
+    r.write("big.rs", &new);
+    let app = app_on(&r);
+    assert!(app.visible.iter().any(|row| row.marker() == '+'));
+    assert!(app.visible.iter().any(|row| row.marker() == '-'));
+
+    let area = Rect { x: 0, y: 0, width: 140, height: 40 };
+    let inner = ui::read_inner_rect(area, &app);
+    assert!(
+        app.visible.len() > inner.height as usize,
+        "the diff must overflow: {} rows in {}",
+        app.visible.len(),
+        inner.height
+    );
+    let buf = render_buffer(&app);
+    let border_x = inner.x + inner.width;
+    let added = app.palette().mark(Ink::Added, Fill::Base);
+    let removed = app.palette().mark(Ink::Removed, Fill::Base);
+    let cells: Vec<_> = (inner.y..inner.y + inner.height)
+        .filter_map(|y| buf.cell((border_x, y)).cloned())
+        .collect();
+    assert!(cells.iter().any(|c| c.symbol() == "┃"), "overflow paints a thumb:\n{}", dump(&buf));
+    assert!(cells.iter().any(|c| c.fg == added), "the overview shows added hue:\n{}", dump(&buf));
+    assert!(
+        cells.iter().any(|c| c.fg == removed),
+        "the overview shows removed hue:\n{}",
+        dump(&buf)
+    );
+}

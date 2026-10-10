@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Band, Focus, FooterAction, Mode, Tab};
 use crate::config::NavigatorPosition;
-use crate::diff::{FileDiff, MarkerKind, Notice, RenderedKind, Row};
+use crate::diff::{Bar, FileDiff, MarkerKind, Notice, RenderedKind, Row};
 use crate::file_list::RowKind;
 use crate::forge;
 use crate::git;
@@ -1877,6 +1877,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
         if !below.is_empty() {
             frame.render_widget(Paragraph::new(below), bands[2]);
         }
+        paint_diff_overview(frame, app, area, inner, height);
         return;
     }
 
@@ -1889,6 +1890,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
         let band = Rect { y: inner.y + body_h as u16, height: 1, ..inner };
         render_find_band(frame, app, band);
     }
+    paint_diff_overview(frame, app, area, inner, body_h);
 }
 
 /// The line-number column width for a diff of `rows` lines.
@@ -4513,6 +4515,151 @@ fn note_markdown_regions(
 /// A scroll row, saturating so a huge render pins to the end.
 fn saturating_row(scroll: usize) -> u16 {
     u16::try_from(scroll).unwrap_or(u16::MAX)
+}
+
+/// One slice of the file-diff overview: change hue and whether it sits in the viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverviewCell {
+    pub kind: OverviewKind,
+    pub thumb: bool,
+}
+
+/// The change hue a document slice paints on the overview.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverviewKind {
+    None,
+    Added,
+    Removed,
+    Both,
+}
+
+/// Map the whole diff onto `track_h` border cells. Empty when the file fits the viewport.
+#[must_use]
+pub fn diff_overview(
+    rows: &[Row],
+    heights: &[usize],
+    scroll_display: usize,
+    viewport: usize,
+    track_h: usize,
+) -> Vec<OverviewCell> {
+    if rows.len() != heights.len() || track_h == 0 {
+        return Vec::new();
+    }
+    let content: usize = heights.iter().sum();
+    if content == 0 || content <= viewport {
+        return Vec::new();
+    }
+    let mut starts = Vec::with_capacity(rows.len());
+    let mut at = 0usize;
+    for &h in heights {
+        starts.push(at);
+        at += h;
+    }
+    let view_end = scroll_display.saturating_add(viewport);
+    (0..track_h)
+        .map(|y| {
+            let lo = y * content / track_h;
+            let hi = ((y + 1) * content / track_h).max(lo + 1).min(content);
+            let mut kind = OverviewKind::None;
+            for (i, row) in rows.iter().enumerate() {
+                let a = starts[i];
+                let b = a + heights[i];
+                if b <= lo || a >= hi {
+                    continue;
+                }
+                kind = merge_overview(kind, row_overview(row));
+            }
+            OverviewCell { kind, thumb: hi > scroll_display && lo < view_end }
+        })
+        .collect()
+}
+
+fn row_overview(row: &Row) -> OverviewKind {
+    match row {
+        Row::Insertion { .. } => OverviewKind::Added,
+        Row::Deletion { .. } => OverviewKind::Removed,
+        Row::Fold { lines } => {
+            lines.iter().fold(OverviewKind::None, |k, r| merge_overview(k, row_overview(r)))
+        }
+        Row::Rendered { kind: RenderedKind::Block { bar: Some(Bar::Added), .. }, .. } => {
+            OverviewKind::Added
+        }
+        Row::Rendered { kind: RenderedKind::Block { bar: Some(Bar::Modified), .. }, .. } => {
+            OverviewKind::Both
+        }
+        Row::Rendered { kind: RenderedKind::Marker { kind: MarkerKind::Removed, .. }, .. } => {
+            OverviewKind::Removed
+        }
+        Row::Context { .. } | Row::Rendered { .. } => OverviewKind::None,
+    }
+}
+
+fn merge_overview(a: OverviewKind, b: OverviewKind) -> OverviewKind {
+    match (a, b) {
+        (OverviewKind::None, x) | (x, OverviewKind::None) => x,
+        (OverviewKind::Both, _) | (_, OverviewKind::Both) => OverviewKind::Both,
+        (OverviewKind::Added, OverviewKind::Added) => OverviewKind::Added,
+        (OverviewKind::Removed, OverviewKind::Removed) => OverviewKind::Removed,
+        (OverviewKind::Added, OverviewKind::Removed)
+        | (OverviewKind::Removed, OverviewKind::Added) => OverviewKind::Both,
+    }
+}
+
+fn diff_display_heights(app: &App, width: usize) -> Vec<usize> {
+    let gutter_w = gutter_for(&app.diff);
+    let p = app.palette();
+    let cards = app.card_rows();
+    let editing = editing_comment(app);
+    app.visible
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let base = row_height(r, gutter_w, width, app.wrap);
+            let card: usize = cards
+                .iter()
+                .filter(|&&(row, ci)| row == i && Some(ci) != editing)
+                .filter_map(|&(_, ci)| app.store.get(ci))
+                .map(|c| comment_card_lines(c, width, p).len())
+                .sum();
+            base + card
+        })
+        .collect()
+}
+
+fn paint_diff_overview(frame: &mut Frame, app: &App, area: Rect, inner: Rect, body_h: usize) {
+    if body_h == 0 || area.width == 0 {
+        return;
+    }
+    let heights = diff_display_heights(app, inner.width as usize);
+    let scroll = heights.iter().take(app.diff_scroll).sum();
+    let cells = diff_overview(&app.visible, &heights, scroll, body_h, body_h);
+    if cells.is_empty() {
+        return;
+    }
+    let p = app.palette();
+    let track = Rect {
+        x: area.x.saturating_add(area.width.saturating_sub(1)),
+        y: inner.y,
+        width: 1,
+        height: body_h as u16,
+    };
+    let lines: Vec<Line> = cells
+        .iter()
+        .map(|c| {
+            let (sym, ink) = match (c.thumb, c.kind) {
+                (true, OverviewKind::Added) => ("┃", Ink::Added),
+                (true, OverviewKind::Removed) => ("┃", Ink::Removed),
+                (true, OverviewKind::Both) => ("┃", Ink::Modified),
+                (true, OverviewKind::None) => ("┃", Ink::Accent),
+                (false, OverviewKind::Added) => ("│", Ink::Added),
+                (false, OverviewKind::Removed) => ("│", Ink::Removed),
+                (false, OverviewKind::Both) => ("│", Ink::Modified),
+                (false, OverviewKind::None) => ("│", Ink::Border),
+            };
+            Line::from(Span::styled(sym, Style::default().fg(p.mark(ink, Fill::Base))))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), track);
 }
 
 /// A scrollbar for the `PR` read pane when its content overflows.

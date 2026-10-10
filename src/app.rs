@@ -1422,9 +1422,10 @@ impl App {
                 let diff = self.cache.get_file(path.to_string(), &content, &self.highlighter);
                 (diff, content)
             }
-            Err(notice) => {
-                (Arc::new(FileDiff::notice(path.to_string(), None, notice, View::File)), String::new())
-            }
+            Err(notice) => (
+                Arc::new(FileDiff::notice(path.to_string(), None, notice, View::File)),
+                String::new(),
+            ),
         }
     }
 

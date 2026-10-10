@@ -2657,7 +2657,10 @@ fn a_new_turn_clears_last_turn_until_it_writes() {
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
     observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
     app.reload().unwrap();
-    assert!(app.entries.is_empty(), "a new turn starts from the current tree, so last-turn is empty");
+    assert!(
+        app.entries.is_empty(),
+        "a new turn starts from the current tree, so last-turn is empty"
+    );
 }
 
 #[test]
