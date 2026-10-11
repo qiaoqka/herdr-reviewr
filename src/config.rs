@@ -747,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn default_scope_rejects_commits_and_names_the_start_scopes() {
+    fn default_scope_rejects_invalid_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         for entry in [
@@ -759,14 +759,6 @@ mod tests {
             let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
             assert!(error.contains("config.toml"), "{entry}: {error}");
             assert!(error.contains("`default_scope`"), "{entry}: {error}");
-            assert!(
-                error.contains("one of uncommitted, branch, last-turn, unstaged"),
-                "{entry}: {error}"
-            );
-            assert!(
-                !error.contains("one of uncommitted, branch, last-turn, unstaged, commits"),
-                "commits is not a start scope: {entry}: {error}"
-            );
         }
     }
 

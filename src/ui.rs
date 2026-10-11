@@ -332,25 +332,7 @@ pub fn diff_viewport_height(area: Rect, app: &App) -> usize {
 #[must_use]
 pub fn diff_row_heights(app: &App, area: Rect) -> Vec<usize> {
     let width = inner_rect(panes(area, app).diff).width as usize;
-    let gutter_w = gutter_for(&app.diff);
-    let p = app.palette();
-    // Wrapped lines plus cards, minus the one being edited, exactly as painted.
-    let cards = app.card_rows();
-    let editing = editing_comment(app);
-    app.visible
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let base = row_height(r, gutter_w, width, app.wrap);
-            let card: usize = cards
-                .iter()
-                .filter(|&&(row, ci)| row == i && Some(ci) != editing)
-                .filter_map(|&(_, ci)| app.store.get(ci))
-                .map(|c| comment_card_lines(c, width, p).len())
-                .sum();
-            base + card
-        })
-        .collect()
+    diff_heights_for_width(app, width)
 }
 
 /// One painted display line of the read pane, recorded for every hit test.
@@ -1948,7 +1930,7 @@ struct RowLayout<'a> {
 /// A row's per-row highlight state.
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
-struct RowState {
+struct RowState<'a> {
     commented: bool,
     cursor: bool,
     selected: bool,
@@ -1957,11 +1939,11 @@ struct RowState {
     /// Whether a rendered row leads its block and so shows its line number.
     lead: bool,
     /// Comments covering this row, for Kind decorations.
-    kind_comments: Vec<Comment>,
+    kind_comments: Vec<&'a Comment>,
 }
 
 /// A diff row's display lines: bar, number, tinted code, wrapped or h-scrolled.
-fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'static>> {
+fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState<'_>) -> Vec<Line<'static>> {
     let RowLayout {
         gutter_w,
         width,
@@ -2321,7 +2303,7 @@ struct Cell {
 }
 
 /// The strongest Kind mark on this source column of `row`.
-fn kind_on_cell(comments: &[Comment], row: &Row, src: usize) -> Option<CommentKind> {
+fn kind_on_cell(comments: &[&Comment], row: &Row, src: usize) -> Option<CommentKind> {
     let col = (src as u32).saturating_add(1);
     comments
         .iter()
@@ -2503,13 +2485,11 @@ fn render_find_band(frame: &mut Frame, app: &App, area: Rect) {
 const TOOLBAR_LOOKS_LABEL: &str = " 👍 looks good";
 const TOOLBAR_DELETE_LABEL: &str = " ✗ delete";
 
-/// Xs of the two labels. A span starts at the last char; a whole line starts at `code_left`.
-fn toolbar_pair_xs(last_char: Option<(u16, u16)>, code_left: u16) -> (u16, u16) {
+/// Xs of the two labels. A span starts at the last char's left; a whole line at `code_left`.
+fn toolbar_pair_xs(last_char: Option<u16>, code_left: u16) -> (u16, u16) {
     let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
-    match last_char {
-        Some((x, _)) => (x, x + looks_w),
-        None => (code_left, code_left + looks_w),
-    }
+    let x = last_char.unwrap_or(code_left);
+    (x, x + looks_w)
 }
 
 /// The first selected row the Kind toolbar sits above.
@@ -2530,7 +2510,7 @@ fn char_visual(
     pane_x: u16,
     prefix_w: usize,
     code_width: usize,
-) -> Option<(usize, u16, u16)> {
+) -> Option<(usize, u16)> {
     let cells = plain_cells(row);
     let segs = if app.wrap && !matches!(row, Row::Rendered { .. }) {
         wrap_segments(&cells, code_width.max(1), ContinuationSpaces::Trim)
@@ -2541,27 +2521,21 @@ fn char_visual(
         cells.get(*s..*e).is_some_and(|slice| slice.iter().any(|c| c.src == chr))
     })?;
     let col: usize = cells[s..e].iter().take_while(|c| c.src < chr).map(|c| c.w).sum();
-    let w = cells[s..e].iter().find(|c| c.src == chr).map(|c| c.w).unwrap_or(1);
     // Unwrap paints `h_scroll` away; the bar must use the same visible column.
     let col = if app.wrap { col } else { col.saturating_sub(app.h_scroll) };
     let x = pane_x.saturating_add(prefix_w as u16).saturating_add(col as u16);
-    Some((seg, x, w as u16))
+    Some((seg, x))
 }
 
-/// Screen x and width of the settled span's last character, if any.
-fn last_char_screen(
-    app: &App,
-    pane_x: u16,
-    prefix_w: usize,
-    code_width: usize,
-) -> Option<(u16, u16)> {
+/// Screen x of the settled span's last character, if any.
+fn last_char_screen(app: &App, pane_x: u16, prefix_w: usize, code_width: usize) -> Option<u16> {
     let drag = app.settled_selection()?;
     if drag.surface != crate::selection::Surface::Read {
         return None;
     }
     let b = drag.ordered().1;
     let row = app.visible.get(b.row)?;
-    char_visual(app, row, b.chr, pane_x, prefix_w, code_width).map(|(_, x, w)| (x, w))
+    char_visual(app, row, b.chr, pane_x, prefix_w, code_width).map(|(_, x)| x)
 }
 
 /// Shift `x` left so a width-2 glyph at `x-1` cannot skip the first chip cell on flush.
@@ -2617,7 +2591,7 @@ fn kind_toolbar_y(inner: Rect, app: &App, slots: &[Slot]) -> Option<u16> {
         .and_then(|d| {
             let a = d.ordered().0;
             let row = app.visible.get(a.row)?;
-            char_visual(app, row, a.chr, inner.x, prefix_w, code_width).map(|(seg, _, _)| seg)
+            char_visual(app, row, a.chr, inner.x, prefix_w, code_width).map(|(seg, _)| seg)
         })
         .unwrap_or(0);
     let idx = slots
@@ -2730,18 +2704,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_span_toolbar_starts_at_the_last_char() {
-        let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
-        assert_eq!(toolbar_pair_xs(Some((40, 1)), 4), (40, 40 + looks_w));
-    }
-
-    #[test]
-    fn a_whole_line_toolbar_starts_at_the_code_left() {
-        let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
-        assert_eq!(toolbar_pair_xs(None, 7), (7, 7 + looks_w));
-    }
-
-    #[test]
     fn a_chip_start_eats_the_wide_char_that_would_skip_into_it() {
         let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 8, 1));
         buf.set_string(0, 0, "这ab", Style::default());
@@ -2762,6 +2724,79 @@ mod tests {
     fn a_chip_end_keeps_a_pad_after_delete() {
         assert_eq!(toolbar_chip_end(10, 20, 80), 31);
         assert_eq!(toolbar_chip_end(70, 20, 80), 80);
+    }
+
+    fn ins_row(no: u32, text: &str) -> Row {
+        Row::Insertion {
+            new_no: no,
+            spans: vec![crate::diff::Span { text: text.into(), color: Default::default() }],
+            emphasis: vec![],
+            cr: false,
+        }
+    }
+
+    fn del_row(no: u32, text: &str) -> Row {
+        Row::Deletion {
+            old_no: no,
+            spans: vec![crate::diff::Span { text: text.into(), color: Default::default() }],
+            emphasis: vec![],
+            cr: false,
+        }
+    }
+
+    fn kind_comment(
+        kind: CommentKind,
+        side: crate::model::Side,
+        start: u32,
+        end: u32,
+        start_col: Option<u32>,
+        end_col: Option<u32>,
+    ) -> Comment {
+        Comment {
+            file: "a.rs".into(),
+            side,
+            start,
+            end,
+            start_col,
+            end_col,
+            kind,
+            ..Comment::default()
+        }
+    }
+
+    #[test]
+    fn kind_on_cell_delete_wins_the_overlap() {
+        let row = ins_row(7, "abcdef");
+        let del = kind_comment(CommentKind::Delete, crate::model::Side::New, 7, 7, None, None);
+        let ok = kind_comment(CommentKind::LooksGood, crate::model::Side::New, 7, 7, None, None);
+        assert_eq!(kind_on_cell(&[&del, &ok], &row, 0), Some(CommentKind::Delete));
+    }
+
+    #[test]
+    fn kind_on_cell_looks_good_wins_over_a_span_comment() {
+        let row = ins_row(7, "abcdef");
+        let ok = kind_comment(CommentKind::LooksGood, crate::model::Side::New, 7, 7, None, None);
+        let note =
+            kind_comment(CommentKind::Comment, crate::model::Side::New, 7, 7, Some(1), Some(3));
+        assert_eq!(kind_on_cell(&[&ok, &note], &row, 0), Some(CommentKind::LooksGood));
+    }
+
+    #[test]
+    fn kind_on_cell_uses_the_row_side() {
+        let row = del_row(7, "old");
+        let old = kind_comment(CommentKind::Delete, crate::model::Side::Old, 7, 7, None, None);
+        let new = kind_comment(CommentKind::LooksGood, crate::model::Side::New, 7, 7, None, None);
+        assert_eq!(kind_on_cell(&[&old, &new], &row, 0), Some(CommentKind::Delete));
+    }
+
+    #[test]
+    fn kind_on_cell_span_end_is_exclusive() {
+        let row = ins_row(7, "abcdef");
+        let note =
+            kind_comment(CommentKind::LooksGood, crate::model::Side::New, 7, 7, Some(1), Some(3));
+        assert_eq!(kind_on_cell(&[&note], &row, 0), Some(CommentKind::LooksGood));
+        assert_eq!(kind_on_cell(&[&note], &row, 1), Some(CommentKind::LooksGood));
+        assert_eq!(kind_on_cell(&[&note], &row, 2), None);
     }
 
     #[test]
@@ -4835,18 +4870,19 @@ pub fn diff_overview(
         at += h;
     }
     let view_end = scroll_display.saturating_add(viewport);
+    let mut row_i = 0;
     (0..track_h)
         .map(|y| {
             let lo = y * content / track_h;
             let hi = ((y + 1) * content / track_h).max(lo + 1).min(content);
+            while row_i + 1 < starts.len() && starts[row_i + 1] <= lo {
+                row_i += 1;
+            }
             let mut kind = OverviewKind::None;
-            for (i, row) in rows.iter().enumerate() {
-                let a = starts[i];
-                let b = a + heights[i];
-                if b <= lo || a >= hi {
-                    continue;
-                }
-                kind = merge_overview(kind, row_overview(row));
+            let mut i = row_i;
+            while i < rows.len() && starts[i] < hi {
+                kind = merge_overview(kind, row_overview(&rows[i]));
+                i += 1;
             }
             OverviewCell { kind, thumb: hi > scroll_display && lo < view_end }
         })
@@ -4884,9 +4920,10 @@ fn merge_overview(a: OverviewKind, b: OverviewKind) -> OverviewKind {
     }
 }
 
-fn diff_display_heights(app: &App, width: usize) -> Vec<usize> {
+fn diff_heights_for_width(app: &App, width: usize) -> Vec<usize> {
     let gutter_w = gutter_for(&app.diff);
     let p = app.palette();
+    // Wrapped lines plus cards, minus the one being edited, exactly as painted.
     let cards = app.card_rows();
     let editing = editing_comment(app);
     app.visible
@@ -4903,6 +4940,10 @@ fn diff_display_heights(app: &App, width: usize) -> Vec<usize> {
             base + card
         })
         .collect()
+}
+
+fn diff_display_heights(app: &App, width: usize) -> Vec<usize> {
+    diff_heights_for_width(app, width)
 }
 
 fn paint_diff_overview(frame: &mut Frame, app: &App, area: Rect, inner: Rect, body_h: usize) {

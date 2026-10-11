@@ -4015,9 +4015,9 @@ impl App {
         }
     }
 
-    /// Comments covering visible row `li`, for Kind decorations on that row.
+    /// Comments covering visible row `li` that can paint a Kind mark.
     #[must_use]
-    pub fn kind_comments_on_row(&self, li: usize) -> Vec<Comment> {
+    pub fn kind_comments_on_row(&self, li: usize) -> Vec<&Comment> {
         let Some(file) = self.diff_path.as_deref() else {
             return Vec::new();
         };
@@ -4027,7 +4027,7 @@ impl App {
         self.store
             .iter()
             .filter(|c| c.file == file && self.comment_in_view(c) && line_in(c, row))
-            .cloned()
+            .filter(|c| c.is_span() || c.kind != crate::model::CommentKind::Comment)
             .collect()
     }
 
@@ -5203,14 +5203,14 @@ impl App {
         }
     }
 
-    /// Export comments to `target`. A consuming target (send) takes only pending
-    /// comments and marks them sent; copy takes the whole set and leaves `sent` alone.
+    /// Export comments to `target`. Send takes only pending comments and marks
+    /// them sent; copy takes the whole set and leaves `sent` alone.
     pub fn export(&mut self, target: &dyn ExportTarget) -> bool {
         if self.store.is_empty() {
             self.status = "no comments yet".to_string();
             return false;
         }
-        let sending: Vec<&Comment> = if target.consumes_comments() {
+        let sending: Vec<&Comment> = if target.marks_sent_on_success() {
             self.store.iter().filter(|c| !c.sent).collect()
         } else {
             self.store.iter().collect()
@@ -5224,7 +5224,7 @@ impl App {
         logln!("export ({n}) -> {} ::\n{text}", target.label());
         let delivered = match target.export(&text) {
             Ok(()) => {
-                if target.consumes_comments() {
+                if target.marks_sent_on_success() {
                     self.store.mark_pending_sent();
                 }
                 self.status = target.success_message(n);

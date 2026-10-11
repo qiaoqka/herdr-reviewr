@@ -424,7 +424,7 @@ fn pair_homologs(
     if old_texts.len() == new_texts.len() {
         for (k, d) in dels.enumerate() {
             let p = inss.start + k;
-            let (_, old_e, new_e) = word_emphasis(&old_texts[k], &new_texts[k]);
+            let (old_e, new_e) = char_emphasis(&old_texts[k], &new_texts[k]);
             if let Row::Deletion { emphasis, .. } = &mut rows[d] {
                 *emphasis = old_e;
             }
@@ -457,19 +457,21 @@ fn pair_homologs(
         }
         let candidates = (next_ins..inss.end).filter(|&p| !claimed[p - inss.start]);
         for p in candidates.take(SIMILAR_WINDOW) {
-            let (ratio, old_e, new_e) = word_emphasis(&old_texts[k], &new_texts[p - inss.start]);
-            if ratio >= MIN_SIMILARITY {
-                if let Row::Deletion { emphasis, .. } = &mut rows[d] {
-                    *emphasis = old_e;
-                }
-                if let Row::Insertion { emphasis, .. } = &mut rows[p] {
-                    *emphasis = new_e;
-                }
-                claimed[p - inss.start] = true;
-                pairs.push((d, p));
-                next_ins = p + 1;
-                break;
+            let new = &new_texts[p - inss.start];
+            if word_ratio(&old_texts[k], new) < MIN_SIMILARITY {
+                continue;
             }
+            let (old_e, new_e) = char_emphasis(&old_texts[k], new);
+            if let Row::Deletion { emphasis, .. } = &mut rows[d] {
+                *emphasis = old_e;
+            }
+            if let Row::Insertion { emphasis, .. } = &mut rows[p] {
+                *emphasis = new_e;
+            }
+            claimed[p - inss.start] = true;
+            pairs.push((d, p));
+            next_ins = p + 1;
+            break;
         }
     }
 }
@@ -481,11 +483,14 @@ const SIMILAR_WINDOW: usize = 64;
 /// pairs land near 0.6–0.65, real edits near 0.71–0.78.
 const MIN_SIMILARITY: f32 = 0.7;
 
-/// Word-ratio for pairing; ranges are char-level (VS Code refineDiff + 2/3 word expand).
-fn word_emphasis(old: &str, new: &str) -> (f32, Vec<CharRange>, Vec<CharRange>) {
-    let ratio = TextDiff::from_words(old, new).ratio();
+fn word_ratio(old: &str, new: &str) -> f32 {
+    TextDiff::from_words(old, new).ratio()
+}
+
+/// Char-level ranges (VS Code refineDiff + 2/3 word expand). Score pairing separately.
+fn char_emphasis(old: &str, new: &str) -> (Vec<CharRange>, Vec<CharRange>) {
     let (old_ranges, new_ranges) = char_ranges(old, new);
-    (ratio, finish_ranges(old_ranges, old), finish_ranges(new_ranges, new))
+    (finish_ranges(old_ranges, old), finish_ranges(new_ranges, new))
 }
 
 /// The char ranges only each side has, from a character LCS.

@@ -117,9 +117,9 @@ pub trait ExportTarget {
     fn success_message(&self, count: usize) -> String;
     /// The status after a failed export, `copy` naming the copy key; the cause goes to the log.
     fn failure_message(&self, error: &anyhow::Error, copy: &str) -> String;
-    /// Whether a successful export removes the comments from the store.
+    /// Whether a successful export marks pending comments sent.
     /// Send does; clipboard copy does not, so the reviewer can still edit.
-    fn consumes_comments(&self) -> bool {
+    fn marks_sent_on_success(&self) -> bool {
         true
     }
 }
@@ -168,7 +168,7 @@ impl ExportTarget for Clipboard {
         clipboard::write(text)
     }
 
-    fn consumes_comments(&self) -> bool {
+    fn marks_sent_on_success(&self) -> bool {
         false
     }
 }

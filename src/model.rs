@@ -252,16 +252,6 @@ impl Comment {
     }
 }
 
-/// The strongest Kind mark among `comments` on this cell.
-#[must_use]
-pub fn strongest_kind_mark<'a>(
-    comments: impl IntoIterator<Item = &'a Comment>,
-    line_no: u32,
-    col: u32,
-) -> Option<CommentKind> {
-    comments.into_iter().filter_map(|c| c.kind_mark(line_no, col)).max_by_key(|k| k.paint_rank())
-}
-
 impl Default for Comment {
     fn default() -> Self {
         Self {
@@ -353,7 +343,7 @@ impl CommentStore {
         }
     }
 
-    /// Remove and return the comment at `index` (delete, or consume one on export).
+    /// Remove and return the comment at `index`.
     pub fn take(&mut self, index: usize) -> Option<Comment> {
         if index < self.items.len() {
             self.ids.remove(index);
@@ -361,12 +351,6 @@ impl CommentStore {
         } else {
             None
         }
-    }
-
-    /// Remove and return every comment (consume-all on a successful export).
-    pub fn take_all(&mut self) -> Vec<Comment> {
-        self.ids.clear();
-        std::mem::take(&mut self.items)
     }
 }
 
@@ -425,15 +409,15 @@ mod tests {
     }
 
     #[test]
-    fn take_one_and_take_all_consume() {
+    fn take_one_and_take_remaining() {
         let mut s = CommentStore::new();
         s.add(comment("a.rs", 1, 1, "one"));
         s.add(comment("b.rs", 2, 2, "two"));
         let taken = s.take(0).unwrap();
         assert_eq!(taken.text, "one");
         assert_eq!(s.len(), 1);
-        let rest = s.take_all();
-        assert_eq!(rest.len(), 1);
+        let rest = s.take(0).unwrap();
+        assert_eq!(rest.text, "two");
         assert!(s.is_empty());
         assert!(s.take(0).is_none());
     }
@@ -448,7 +432,7 @@ mod tests {
         assert_eq!(s.index_of(id), Some(0), "the list shifted, the id followed");
         s.edit(0, "edited".into());
         assert_eq!(s.id(0), Some(id));
-        s.take_all();
+        assert!(s.take(0).is_some());
         let three = s.add(comment("a.rs", 3, 3, "three"));
         assert_ne!(s.id(three), Some(id), "a fresh comment never takes an old id");
         assert_eq!(s.index_of(id), None);
@@ -526,25 +510,5 @@ mod tests {
         assert_eq!(c.kind_mark(8, 1), Some(super::CommentKind::Delete));
         assert_eq!(c.kind_mark(9, 1), Some(super::CommentKind::Delete));
         assert_eq!(c.kind_mark(9, 2), None);
-    }
-
-    #[test]
-    fn delete_wins_over_looks_good_and_comment() {
-        let mut del = comment("a.rs", 7, 7, "");
-        del.kind = super::CommentKind::Delete;
-        let mut ok = comment("a.rs", 7, 7, "");
-        ok.kind = super::CommentKind::LooksGood;
-        let mut note = comment("a.rs", 7, 7, "x");
-        note.start_col = Some(1);
-        note.end_col = Some(3);
-        assert_eq!(
-            super::strongest_kind_mark([&del, &ok, &note], 7, 1),
-            Some(super::CommentKind::Delete)
-        );
-        assert_eq!(
-            super::strongest_kind_mark([&ok, &note], 7, 1),
-            Some(super::CommentKind::LooksGood)
-        );
-        assert_eq!(super::strongest_kind_mark([&note], 7, 1), Some(super::CommentKind::Comment));
     }
 }

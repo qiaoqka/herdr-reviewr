@@ -24,19 +24,19 @@ use ratatui::layout::Rect;
 /// An export target that records what it was handed and can be made to fail.
 struct FakeTarget {
     ok: bool,
-    consumes: bool,
+    marks_sent: bool,
     captured: RefCell<Vec<String>>,
 }
 
 impl FakeTarget {
     fn ok() -> Self {
-        Self { ok: true, consumes: true, captured: RefCell::new(Vec::new()) }
+        Self { ok: true, marks_sent: true, captured: RefCell::new(Vec::new()) }
     }
     fn failing() -> Self {
-        Self { ok: false, consumes: true, captured: RefCell::new(Vec::new()) }
+        Self { ok: false, marks_sent: true, captured: RefCell::new(Vec::new()) }
     }
     fn copying() -> Self {
-        Self { ok: true, consumes: false, captured: RefCell::new(Vec::new()) }
+        Self { ok: true, marks_sent: false, captured: RefCell::new(Vec::new()) }
     }
     fn last(&self) -> String {
         self.captured.borrow().last().cloned().unwrap_or_default()
@@ -58,8 +58,8 @@ impl ExportTarget for FakeTarget {
         self.captured.borrow_mut().push(text.to_string());
         if self.ok { Ok(()) } else { bail!("fake export failure") }
     }
-    fn consumes_comments(&self) -> bool {
-        self.consumes
+    fn marks_sent_on_success(&self) -> bool {
+        self.marks_sent
     }
 }
 
@@ -7198,7 +7198,7 @@ impl ExportTarget for SelClipboard {
         SEL_COPIES.with(|c| c.borrow_mut().push(text.to_string()));
         Ok(())
     }
-    fn consumes_comments(&self) -> bool {
+    fn marks_sent_on_success(&self) -> bool {
         false
     }
 }
