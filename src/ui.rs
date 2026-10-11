@@ -2485,11 +2485,13 @@ fn render_find_band(frame: &mut Frame, app: &App, area: Rect) {
 const TOOLBAR_LOOKS_LABEL: &str = " 👍 looks good";
 const TOOLBAR_DELETE_LABEL: &str = " ✗ delete";
 
-/// Xs of the two labels. A span starts at the last char's left; a whole line at `code_left`.
-fn toolbar_pair_xs(last_char: Option<u16>, code_left: u16) -> (u16, u16) {
+/// Xs of the two labels. A span seams at the release char's right; a whole line at `code_left`.
+fn toolbar_pair_xs(release: Option<u16>, code_left: u16) -> (u16, u16) {
     let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
-    let x = last_char.unwrap_or(code_left);
-    (x, x + looks_w)
+    match release {
+        Some(seam) => (seam.saturating_sub(looks_w), seam),
+        None => (code_left, code_left + looks_w),
+    }
 }
 
 /// The first selected row the Kind toolbar sits above.
@@ -2502,7 +2504,7 @@ fn toolbar_first_row(app: &App) -> usize {
     app.selection_range().0
 }
 
-/// Wrap segment and in-segment screen x of `chr` on `row`.
+/// Wrap segment, left screen x, and width of `chr` on `row`.
 fn char_visual(
     app: &App,
     row: &Row,
@@ -2510,7 +2512,7 @@ fn char_visual(
     pane_x: u16,
     prefix_w: usize,
     code_width: usize,
-) -> Option<(usize, u16)> {
+) -> Option<(usize, u16, u16)> {
     let cells = plain_cells(row);
     let segs = if app.wrap && !matches!(row, Row::Rendered { .. }) {
         wrap_segments(&cells, code_width.max(1), ContinuationSpaces::Trim)
@@ -2521,21 +2523,22 @@ fn char_visual(
         cells.get(*s..*e).is_some_and(|slice| slice.iter().any(|c| c.src == chr))
     })?;
     let col: usize = cells[s..e].iter().take_while(|c| c.src < chr).map(|c| c.w).sum();
+    let w = cells[s..e].iter().find(|c| c.src == chr).map(|c| c.w).unwrap_or(1);
     // Unwrap paints `h_scroll` away; the bar must use the same visible column.
     let col = if app.wrap { col } else { col.saturating_sub(app.h_scroll) };
     let x = pane_x.saturating_add(prefix_w as u16).saturating_add(col as u16);
-    Some((seg, x))
+    Some((seg, x, w as u16))
 }
 
-/// Screen x of the settled span's last character, if any.
-fn last_char_screen(app: &App, pane_x: u16, prefix_w: usize, code_width: usize) -> Option<u16> {
+/// Screen x of the release character's right edge, if this is a Read span.
+fn release_char_screen(app: &App, pane_x: u16, prefix_w: usize, code_width: usize) -> Option<u16> {
     let drag = app.settled_selection()?;
     if drag.surface != crate::selection::Surface::Read {
         return None;
     }
-    let b = drag.ordered().1;
-    let row = app.visible.get(b.row)?;
-    char_visual(app, row, b.chr, pane_x, prefix_w, code_width).map(|(_, x)| x)
+    let row = app.visible.get(drag.extent.row)?;
+    char_visual(app, row, drag.extent.chr, pane_x, prefix_w, code_width)
+        .map(|(_, x, w)| x.saturating_add(w))
 }
 
 /// Shift `x` left so a width-2 glyph at `x-1` cannot skip the first chip cell on flush.
@@ -2569,11 +2572,11 @@ fn toolbar_xs(app: &App, inner: Rect, prefix_w: usize) -> (u16, u16) {
     let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
     let pair_w = looks_w + TOOLBAR_DELETE_LABEL.width() as u16;
     let (looks, _) =
-        toolbar_pair_xs(last_char_screen(app, inner.x, prefix_w, code_width), code_left);
-    // A last-char past the pane (unwrap, or a wrap-edge CJK) must not spill onto the next row.
-    // Do not push left to `code_left`: 👍 may sit a cell into the gutter to center on the last char.
+        toolbar_pair_xs(release_char_screen(app, inner.x, prefix_w, code_width), code_left);
+    // A release past the pane (unwrap, or a wrap-edge CJK) must not spill onto the next row.
+    // Do not push left to `code_left`: 👍 may sit in the gutter so the seam stays on the release.
     let max_looks = inner.x.saturating_add(inner.width).saturating_sub(pair_w);
-    let looks = looks.min(max_looks);
+    let looks = looks.max(inner.x).min(max_looks);
     (looks, looks + looks_w)
 }
 
@@ -2591,7 +2594,7 @@ fn kind_toolbar_y(inner: Rect, app: &App, slots: &[Slot]) -> Option<u16> {
         .and_then(|d| {
             let a = d.ordered().0;
             let row = app.visible.get(a.row)?;
-            char_visual(app, row, a.chr, inner.x, prefix_w, code_width).map(|(seg, _)| seg)
+            char_visual(app, row, a.chr, inner.x, prefix_w, code_width).map(|(seg, _, _)| seg)
         })
         .unwrap_or(0);
     let idx = slots
@@ -2724,6 +2727,18 @@ mod tests {
     fn a_chip_end_keeps_a_pad_after_delete() {
         assert_eq!(toolbar_chip_end(10, 20, 80), 31);
         assert_eq!(toolbar_chip_end(70, 20, 80), 80);
+    }
+
+    #[test]
+    fn a_span_toolbar_seams_at_the_release_char() {
+        let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
+        assert_eq!(toolbar_pair_xs(Some(40), 4), (40 - looks_w, 40));
+    }
+
+    #[test]
+    fn a_whole_line_toolbar_starts_at_the_code_left() {
+        let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
+        assert_eq!(toolbar_pair_xs(None, 7), (7, 7 + looks_w));
     }
 
     fn ins_row(no: u32, text: &str) -> Row {

@@ -846,10 +846,10 @@ fn the_expansion_aligns_row_one_into_the_labeled_grid() {
     assert_eq!(at(&go_line, "go"), at(&move_line, "move"), "labels share a gutter column");
     assert_eq!(
         at(&do_line, "c comment"),
-        at(&go_line, "u/b/t"),
+        at(&go_line, "U/b/t/g/u"),
         "the primary aligns under the same column as the band keys"
     );
-    assert_eq!(at(&go_line, "u/b/t"), at(&move_line, "j k"), "band keys align in one column");
+    assert_eq!(at(&go_line, "U/b/t/g/u"), at(&move_line, "j k"), "band keys align in one column");
 }
 
 #[test]
@@ -4065,9 +4065,9 @@ fn the_commits_header_names_the_pick_and_its_verdict() {
     app.keys_expanded = true;
     let expanded = render(&app);
     assert!(expanded.contains("scope"), "the go band names the scopes:\n{expanded}");
-    assert!(expanded.contains("u/"), "uncommitted stays in the hint: {expanded}");
+    assert!(expanded.contains("U/"), "uncommitted stays in the hint: {expanded}");
     assert!(
-        expanded.contains("/U") || expanded.contains("U "),
+        expanded.contains("/u") || expanded.contains("u "),
         "unstaged is in the hint: {expanded}"
     );
     assert!(expanded.contains("G commits"), "and the picker key:\n{expanded}");

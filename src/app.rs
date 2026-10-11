@@ -2555,9 +2555,8 @@ impl App {
 
     /// After the base moved, reset `Changes` to the top wherever it lives; `All files` keeps its place.
     fn rebase_changes(&mut self) -> Result<()> {
-        // Keep DiffCache: it is keyed by both sides. A file that is only unstaged has the
-        // same old+new under Unstaged and Uncommitted, so wiping forced a full FileDiff
-        // rebuild of the open file on every u/U.
+        // Keep DiffCache (keyed by both sides). Unstaged vs Uncommitted share old+new
+        // for a file that is only unstaged; wiping rebuilt the open FileDiff on every u/U.
         if self.tab == Tab::Changes {
             self.file_cursor = 0;
             self.expanded_folds.clear();
@@ -3384,6 +3383,10 @@ impl App {
 
     pub fn start_comment(&mut self) {
         if self.focus == Focus::Diff && self.has_anchorable_selection() {
+            if self.span_mixes_added_and_removed() {
+                self.status = "select added or removed, not both".to_string();
+                return;
+            }
             // A character span splices the box under the selected +/- row, not the last cursor.
             if let Some((drag, _)) = self.text_comment_span() {
                 let (_, b) = drag.ordered();
@@ -3819,6 +3822,18 @@ impl App {
             return None;
         }
         Some((*drag, text.clone()))
+    }
+
+    /// A span that covers both a deletion row and an insertion row cannot be one side.
+    fn span_mixes_added_and_removed(&self) -> bool {
+        let Some((drag, _)) = self.text_comment_span() else {
+            return false;
+        };
+        let (a, b) = drag.ordered();
+        let hi = b.row.min(self.visible.len().saturating_sub(1));
+        self.visible.get(a.row..=hi).is_some_and(|rows| {
+            rows.iter().any(|row| row.marker() == '-') && rows.iter().any(|row| row.marker() == '+')
+        })
     }
 
     /// The selection's `(side, start, end, snippet)`, rendered or not, by one `anchor()` (G1).
@@ -4828,6 +4843,10 @@ impl App {
     pub fn send_to_agent(&mut self) {
         if self.store.is_empty() {
             self.status = "no comments yet".to_string();
+            return;
+        }
+        if self.store.pending_count() == 0 {
+            self.status = "no new comments".to_string();
             return;
         }
         match herdr::send_target(&self.herdr.ids) {

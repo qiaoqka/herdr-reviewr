@@ -796,13 +796,19 @@ fn toolbar_hits(app: &App, kind: CommentKind) -> Vec<(u16, u16)> {
 
 #[test]
 fn a_span_toolbar_sits_above_the_first_line_around_the_last_char() {
-    let r = edited_repo();
+    let r = Repo::init();
+    r.write("a.rs", "alpha\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\nchanged the middle word here\n");
     let mut app = app_on(&r);
     app.focus = Focus::Diff;
-    let new =
-        app.visible.iter().position(|row| row.marker() == '+' && row.text() == "BETA").unwrap();
-    let (c0, r0) = sel_cell(&app, new, 0);
-    let (c1, r1) = sel_cell(&app, new, 1);
+    let new = app
+        .visible
+        .iter()
+        .position(|row| row.marker() == '+' && row.text() == "changed the middle word here")
+        .unwrap();
+    let (c0, r0) = sel_cell(&app, new, 12);
+    let (c1, r1) = sel_cell(&app, new, 17); // last char of "middle"
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
@@ -819,8 +825,7 @@ fn a_span_toolbar_sits_above_the_first_line_around_the_last_char() {
     let looks_max = looks.iter().map(|p| p.0).max().unwrap();
     let delete_min = delete.iter().map(|p| p.0).min().unwrap();
     assert_eq!(delete_min, looks_max + 1, "padded labels sit side by side");
-    let looks_min = looks.iter().map(|p| p.0).min().unwrap();
-    assert_eq!(looks_min, c1, "chip starts at the last character, like annotate");
+    assert_eq!(delete_min, c1 + 1, "the seam sits on the release character's right edge");
 }
 
 #[test]
@@ -846,15 +851,18 @@ fn a_multiline_span_toolbar_stays_above_the_first_line() {
     let r = Repo::init();
     r.write("a.rs", "alpha\n");
     r.commit_all("init");
-    r.write("a.rs", "alpha\none\ntwo\n");
+    r.write("a.rs", "alpha\none\nchanged the middle word here\n");
     let mut app = app_on(&r);
     app.focus = Focus::Diff;
     let one =
         app.visible.iter().position(|row| row.marker() == '+' && row.text() == "one").unwrap();
-    let two =
-        app.visible.iter().position(|row| row.marker() == '+' && row.text() == "two").unwrap();
+    let two = app
+        .visible
+        .iter()
+        .position(|row| row.marker() == '+' && row.text() == "changed the middle word here")
+        .unwrap();
     let (c0, r0) = sel_cell(&app, one, 0);
-    let (c1, r1) = sel_cell(&app, two, 2); // last char of "two"
+    let (c1, r1) = sel_cell(&app, two, 17); // last char of "middle"
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
@@ -869,8 +877,7 @@ fn a_multiline_span_toolbar_stays_above_the_first_line() {
     let looks_max = looks.iter().map(|p| p.0).max().unwrap();
     let delete_min = delete.iter().map(|p| p.0).min().unwrap();
     assert_eq!(delete_min, looks_max + 1);
-    let looks_min = looks.iter().map(|p| p.0).min().unwrap();
-    assert_eq!(looks_min, c1, "chip starts at the last character");
+    assert_eq!(delete_min, c1 + 1, "the seam sits on the release character's right edge");
 }
 
 #[test]
@@ -917,6 +924,7 @@ fn a_wrapped_removed_span_toolbar_sits_above_that_segment() {
         looks_min < inner.x + 5 + 20,
         "x follows the wrapped last char, not the unwrapped column: {looks_min}"
     );
+    assert!(looks_min < c1, "looks good sits left of the release: {looks_min} {c1}");
 }
 
 #[test]
@@ -1809,6 +1817,27 @@ fn a_partial_select_on_each_side_of_a_replace_keeps_excerpt_after_typing() {
 }
 
 #[test]
+fn a_drag_across_added_and_removed_rows_refuses_the_composer() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    let old =
+        app.visible.iter().position(|row| row.marker() == '-' && row.text() == "beta").unwrap();
+    let new =
+        app.visible.iter().position(|row| row.marker() == '+' && row.text() == "BETA").unwrap();
+
+    let (c0, r0) = sel_cell(&app, old, 0);
+    let (c1, r1) = sel_cell(&app, new, 1);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
+
+    assert!(!app.composing(), "a mixed-side drag must not open the composer");
+    assert_eq!(app.status, "select added or removed, not both");
+    assert!(app.store.is_empty(), "no comment is created");
+}
+
+#[test]
 fn comments_on_added_and_removed_lines_capture_the_snippet() {
     let r = edited_repo();
     let mut app = app_on(&r);
@@ -1871,7 +1900,7 @@ fn a_refresh_while_composing_freezes_input_and_diff() {
 }
 
 #[test]
-fn a_failed_export_keeps_comments_and_success_consumes_them() {
+fn a_failed_export_keeps_comments_and_success_marks_them_sent() {
     let r = edited_repo();
     let mut app = app_on(&r);
     comment_on(&mut app, '+', "one");
@@ -1934,6 +1963,19 @@ fn send_marks_pending_sent_and_a_second_send_is_inert() {
     assert!(!app.export(&second), "nothing new to send");
     assert_eq!(app.status, "no new comments");
     assert!(second.last().is_empty(), "the agent is not pasted again");
+}
+
+#[test]
+fn a_second_send_to_agent_is_no_new_comments_without_enumerating_agents() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "first");
+    assert!(app.export(&FakeTarget::ok()));
+    assert!(app.store.iter().all(|c| c.sent));
+
+    app.send_to_agent();
+    assert_eq!(app.status, "no new comments");
+    assert_ne!(app.mode, Mode::Picker, "no pending comments must not open the picker");
 }
 
 #[test]
@@ -10669,14 +10711,14 @@ fn the_diff_agrees_with_git_diff_under_any_line_ending_rule() {
             "",
             "one\rx\r\ntwo\r\nthree\r\n",
             "one x\r\nTWO\r\nthree\r\n",
-            &["-one\rx", "-two", "-three^M", "+one x", "+TWO", "+three"],
+            &["-one\rx^M", "-two^M", "-three^M", "+one x", "+TWO", "+three"],
         ),
         // The same CR, still there: `auto` sees binary content and converts nothing.
         (
             "",
             "one\rx\ntwo\nthree\n",
             "one\rx\r\nTWO\r\nthree\r\n",
-            &["-one\rx", "-two", "-three", "+one\rx^M", "+TWO", "+three^M"],
+            &["-one\rx", "-two", "-three", "+one\rx^M", "+TWO^M", "+three^M"],
         ),
         // `ident` collapses the expanded keyword on the way in, so only the edit shows.
         ("* ident\n", "$Id$\none\n", "$Id: 0123 $\r\nONE\r\n", &["-one", "+ONE"]),

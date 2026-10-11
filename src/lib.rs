@@ -2395,9 +2395,8 @@ fn dispatch_mouse(
     if app.gesture_active() && matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Down(_)) {
         complete_gesture(app, area, target);
     }
-    // A mouse-down clears the settled highlight, after the proof above.
-    // While composing, keep it: the toolbar click would otherwise drop the span
-    // and `submit_kind` would fall back to a whole line.
+    // A mouse-down clears the settled highlight after the proof above. Keep it while
+    // composing: a toolbar click would drop the span and `submit_kind` would whole-line.
     if matches!(m.kind, MouseEventKind::Down(_)) && !app.composing() {
         app.clear_settled_selection();
     }

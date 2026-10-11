@@ -604,7 +604,11 @@ fn a_checkout_in_a_reftable_linked_worktree_reports_head() {
         .args(["init", "-q", "--ref-format=reftable", "reft"])
         .output()
         .unwrap();
-    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+    if !init.status.success() {
+        let err = String::from_utf8_lossy(&init.stderr);
+        assert!(err.contains("unknown option"), "{}", err);
+        return;
+    }
     let main = r.path().join("reft");
     let git = |dir: &std::path::Path, args: &[&str]| {
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();

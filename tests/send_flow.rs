@@ -377,11 +377,11 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
     }
 }
 
-/// Comments leave only on a `result` reply.
+/// A `result` reply marks comments sent; failures keep them pending.
 #[test]
-fn a_send_consumes_the_comments_only_on_a_result_reply() {
+fn a_send_marks_comments_sent_only_on_a_result_reply() {
     if !in_child() {
-        let dir = run_in_child("a_send_consumes_the_comments_only_on_a_result_reply", true);
+        let dir = run_in_child("a_send_marks_comments_sent_only_on_a_result_reply", true);
         assert!(herdr_calls(dir.path()).contains("agent focus"), "the child delivered no send");
         return;
     }
@@ -415,6 +415,32 @@ fn a_send_consumes_the_comments_only_on_a_result_reply() {
     assert_eq!(app.store.len(), 1, "a result reply keeps the card");
     assert!(app.store.get(0).unwrap().sent, "a result reply marks it sent");
     assert_eq!(app.status, "sent 1 comment to claude");
+}
+
+/// A second `S` after a successful send must not paste the same review again.
+#[test]
+fn a_second_s_after_a_result_does_not_paste_again() {
+    if !in_child() {
+        let _ = run_in_child("a_second_s_after_a_result_does_not_paste_again", true);
+        return;
+    }
+
+    let socket = FakeSocket::serve(&socket_path());
+    agents(&fixture_dir(), ONE_AGENT);
+    let (_repo, mut app) = app();
+    let keymap = Keymap::default();
+    let area = Rect::new(0, 0, 80, 24);
+    write_comment(&mut app, "naming");
+
+    socket.reply(Reply::Result);
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    assert_eq!(socket.requests().len(), 1, "first S pastes once");
+    assert!(app.store.get(0).unwrap().sent);
+
+    socket.reply(Reply::Result);
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    assert_eq!(socket.requests().len(), 1, "second S must not paste the same review");
+    assert_eq!(app.status, "no new comments");
 }
 
 /// A review past Windows' command-line cap sends; one past the send cap refuses.

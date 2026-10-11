@@ -33,8 +33,8 @@
 > - Send/copy: `审阅意见如下:` then `## file` and `### Annotation N (lines …)`. Whole-line
 >   new-side comments skip the excerpt. A Read drag opens the composer under that +/- row
 >   (`lines L:C–L:C` + `Comment on`). Typing keeps the span. New compose floats
->   ` 👍 looks good` / ` ✗ delete` above the first selected wrap segment, from the
->   last character's left edge plus one pad cell (whole-line `c`/gutter is
+>   ` 👍 looks good` / ` ✗ delete` above the first selected wrap segment, seamed
+>   on the release character's right edge (whole-line `c`/gutter is
 >   left-aligned). Delete strikes the line; Looks good underlines it.
 >   `y`/`Y` copy the whole set without flipping `sent`. `S` sends
 >   pending only and marks those cards sent. Removed lines add `, removed`. Written notes

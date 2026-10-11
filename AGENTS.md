@@ -28,8 +28,9 @@ user-initiated `stage-file` action (`git add` of the open file).
   `Comment on: "…"`. Removed lines add `, removed` and quote the deleted text. The comment
   body is `>`. A Read drag opens the composer under that +/- row; typing keeps the span.
   A new compose floats ` 👍 looks good` / ` ✗ delete` above the first selected wrap
-  segment, from the last character's left edge plus one pad cell (whole-line `c` /
-  gutter is left-aligned; no keybinds). `y`/`Y` copy the whole set and leave `sent`.
+  segment; the seam between the labels sits on the release character's right edge
+  (whole-line `c` / gutter is left-aligned; no keybinds). `y`/`Y` copy the whole
+  set and leave `sent`.
   `S` sends pending only and marks those cards sent. `v` and gutter stay whole-line.
 - Do not change the machine `default_scope`. Keep `last-turn` unless the human asks.
 - `reload()` on a Changes-tab scope switch is still synchronous.
