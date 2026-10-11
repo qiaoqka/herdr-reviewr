@@ -1670,8 +1670,9 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
     app.cancel_divider_drag();
     // A key cancels a live gesture without copying, then does its own work.
     app.cancel_gesture();
-    // Any keypress is the user doing something else: the settled highlight clears
-    app.clear_settled_selection();
+    // Most keys drop the highlight; Comment puts it back so `c` can use the span.
+    // Typing in the composer must not take it: each key would drop the character span.
+    let saved_sel = if app.composing() { None } else { app.take_settled_selection() };
 
     if app.composing() {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -1945,7 +1946,10 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             K::BasePick => app.open_base_picker(),
             K::CommitPick => app.open_commit_picker(),
             K::Select => app.toggle_select(),
-            K::Comment => app.start_comment(),
+            K::Comment => {
+                app.restore_settled_selection(saved_sel);
+                app.start_comment();
+            }
             // `delete` needs the diff focused, never an off-screen cursor; `edit` works anywhere.
             K::Edit => app.start_edit(),
             K::Delete if app.focus == Focus::Diff => app.delete_comment(),
@@ -2148,20 +2152,20 @@ fn finish_text_drag(
         app.gesture = Gesture::None;
         match drag.surface {
             // A navigator double or triple copies the row; an empty row clicks.
-            Surface::Files | Surface::PrNav if count >= 2 => {
-                if !multi_click_copy(app, area, drag, target) && clicks_act {
+            Surface::Files | Surface::PrNav if count >= 2 && clicks_act => {
+                if !multi_click_copy(app, area, drag, target) {
                     perform_click(app, m, area, heights, drag)?;
                 }
             }
             // A double copies the word; a wordless cell clicks.
-            Surface::Read | Surface::Painted | Surface::Card { .. } if count == 2 => {
-                if !word_click_copy(app, area, drag, target) && clicks_act {
+            Surface::Read | Surface::Painted | Surface::Card { .. } if count == 2 && clicks_act => {
+                if !word_click_copy(app, area, drag, target) {
                     perform_click(app, m, area, heights, drag)?;
                 }
             }
             // A triple copies the source line; an empty line clicks.
-            Surface::Read | Surface::Painted | Surface::Card { .. } if count >= 3 => {
-                if !line_click_copy(app, area, drag, target) && clicks_act {
+            Surface::Read | Surface::Painted | Surface::Card { .. } if count >= 3 && clicks_act => {
+                if !line_click_copy(app, area, drag, target) {
                     perform_click(app, m, area, heights, drag)?;
                 }
             }
@@ -2266,9 +2270,17 @@ pub fn complete_gesture(app: &mut App, area: Rect, target: &dyn crate::export::E
         && drag.anchor != drag.extent
     {
         let text = drag_text(app, area).unwrap_or_default();
+        let open = drag.surface == crate::selection::Surface::Read && !text.is_empty();
         app.copy_selection_text(target, &text);
         // The copy leaves its span highlighted as feedback.
         app.settle_selection(drag, text);
+        // End the gesture first so a held reload lands before the composer freezes the view.
+        app.cancel_gesture();
+        if open && app.settled_selection().is_some() {
+            app.focus = crate::app::Focus::Diff;
+            app.start_comment();
+        }
+        return;
     }
     app.cancel_gesture();
 }
@@ -2384,7 +2396,9 @@ fn dispatch_mouse(
         complete_gesture(app, area, target);
     }
     // A mouse-down clears the settled highlight, after the proof above.
-    if matches!(m.kind, MouseEventKind::Down(_)) {
+    // While composing, keep it: the toolbar click would otherwise drop the span
+    // and `submit_kind` would fall back to a whole line.
+    if matches!(m.kind, MouseEventKind::Down(_)) && !app.composing() {
         app.clear_settled_selection();
     }
     // Search: chips flip, a click picks and a second opens, the divider drags search's share.
@@ -2436,6 +2450,12 @@ fn dispatch_mouse(
         if app.composing() {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) if !app.divider_drag_captured() => {
+                    if matches!(app.mode, Mode::Composing { editing: None })
+                        && let Some(kind) = ui::hit_composer_toolbar(area, app, m.column, m.row)
+                    {
+                        app.submit_kind(kind);
+                        return Ok(());
+                    }
                     if handle_text_down(app, m, area) {
                         return Ok(());
                     }
@@ -2955,13 +2975,11 @@ mod refresh_tests {
         let mut app = App::new(std::path::PathBuf::from("."), Scope::Uncommitted, None);
         app.store.add(crate::model::Comment {
             file: "a.rs".into(),
-            side: crate::model::Side::New,
             start: 1,
             end: 1,
             lines: "+a".into(),
             text: "keep".into(),
-            diff_anchored: true,
-            rev: crate::model::Rev::Worktree,
+            ..crate::model::Comment::default()
         });
         app.set_config_error("invalid config".to_string());
         let q = Event::Key(KeyEvent::from(KeyCode::Char('q')));

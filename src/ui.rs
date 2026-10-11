@@ -21,7 +21,7 @@ use crate::forge;
 use crate::git;
 use crate::herdr::AgentChoice;
 use crate::keymap::Keymap;
-use crate::model::{ChangeKind, ChangedFile, Comment};
+use crate::model::{ChangeKind, ChangedFile, Comment, CommentKind};
 use crate::roles::Palette;
 use crate::roles::{Fill, Ink};
 use crate::snippet::{snippet_caption_sign, snippet_row_is_comment};
@@ -816,7 +816,7 @@ const CARD_TEXT_X: usize = CARD_INDENT + 2;
 pub(crate) fn card_body_lines(c: &Comment, width: usize) -> Vec<String> {
     let box_w = width.saturating_sub(CARD_INDENT).max(10);
     let text_w = box_w.saturating_sub(4).max(1); // inside "│ " … " │"
-    c.text.split('\n').flat_map(|l| wrap_text(l, text_w)).collect()
+    c.card_text().split('\n').flat_map(|l| wrap_text(l, text_w)).collect()
 }
 
 /// The card selection point under `(col, row)`.
@@ -1696,7 +1696,8 @@ fn comment_card_lines(c: &Comment, width: usize, p: &Palette) -> Vec<Line<'stati
     let body_style = Style::default().fg(p.ink(Ink::Text, Fill::Base));
     let pad = || Span::raw(" ".repeat(INDENT));
 
-    let label = truncate_width(&format!(" comment · {} ", c.location()), box_w.saturating_sub(3));
+    let kind = if c.sent { "sent" } else { "comment" };
+    let label = truncate_width(&format!(" {kind} · {} ", c.location()), box_w.saturating_sub(3));
     let fill = box_w.saturating_sub(3 + label.width());
     let mut lines = vec![Line::from(vec![
         pad(),
@@ -1838,6 +1839,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
                         selected: selecting && row >= lo && row <= hi,
                         hovered: hovered_row == Some(row),
                         lead: app.is_rendered_lead(row),
+                        kind_comments: app.kind_comments_on_row(row),
                     };
                     row_cache = Some((row, render_row(&app.visible[row], layout, state)));
                 }
@@ -1877,6 +1879,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
         if !below.is_empty() {
             frame.render_widget(Paragraph::new(below), bands[2]);
         }
+        render_kind_toolbar(frame, app, inner, &slots);
         paint_diff_overview(frame, app, area, inner, height);
         return;
     }
@@ -1943,7 +1946,7 @@ struct RowLayout<'a> {
 }
 
 /// A row's per-row highlight state.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
 struct RowState {
     commented: bool,
@@ -1953,6 +1956,8 @@ struct RowState {
     hovered: bool,
     /// Whether a rendered row leads its block and so shows its line number.
     lead: bool,
+    /// Comments covering this row, for Kind decorations.
+    kind_comments: Vec<Comment>,
 }
 
 /// A diff row's display lines: bar, number, tinted code, wrapped or h-scrolled.
@@ -1969,7 +1974,7 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
         rendered,
         see,
     } = layout;
-    let RowState { commented, cursor, selected, hovered, lead } = state;
+    let RowState { commented, cursor, selected, hovered, lead, kind_comments } = state;
     // A commented line's number wears your comment color; others are muted.
     let num_ink = if commented { Ink::Comment } else { Ink::TextMuted };
     let highlight = match_style(pal);
@@ -2072,6 +2077,10 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
     for cell in cells.iter_mut().filter(|c| !c.hl) {
         cell.fg = pal.legible(cell.fg, if cell.emph { emph } else { on });
     }
+    let comment_fg = pal.ink(Ink::Comment, on);
+    for cell in &mut cells {
+        cell.kind = kind_on_cell(&kind_comments, row, cell.src);
+    }
 
     let prefix_w = gutter_prefix_width(gutter_w);
     let code_width = width.saturating_sub(prefix_w).max(1);
@@ -2098,7 +2107,7 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
                 ]
             };
             let mut spans = gutter;
-            spans.extend(cells_to_spans(chunk, emph_bg, highlight));
+            spans.extend(cells_to_spans(chunk, emph_bg, highlight, comment_fg));
             let mut line = Line::from(spans);
             if let Some(pad) = width.checked_sub(line.width()).filter(|p| *p > 0) {
                 line.push_span(Span::raw(" ".repeat(pad)));
@@ -2242,6 +2251,7 @@ fn plain_cell(ch: char) -> Cell {
         emph: false,
         hl: false,
         src: 0,
+        kind: None,
     }
 }
 
@@ -2306,6 +2316,23 @@ struct Cell {
     hl: bool,
     /// The source char this cell paints; a tab's cells share one.
     src: usize,
+    /// Kind decoration on this cell, if a comment paints it.
+    kind: Option<CommentKind>,
+}
+
+/// The strongest Kind mark on this source column of `row`.
+fn kind_on_cell(comments: &[Comment], row: &Row, src: usize) -> Option<CommentKind> {
+    let col = (src as u32).saturating_add(1);
+    comments
+        .iter()
+        .filter_map(|c| {
+            let no = match c.side {
+                crate::model::Side::New => row.new_no()?,
+                crate::model::Side::Old => row.old_no()?,
+            };
+            c.kind_mark(no, col)
+        })
+        .max_by_key(|k| k.paint_rank())
 }
 
 /// A row's display cells: tab-expanded, width-measured, emphasis and find flags, plus any CR marker.
@@ -2328,12 +2355,12 @@ fn code_cells(row: &Row, emph_on: bool, hl_ranges: &[(u32, u32)], marker_fg: Col
             let src = idx as usize;
             if ch == '\t' {
                 for _ in 0..(TAB - col % TAB) {
-                    cells.push(Cell { ch: ' ', w: 1, fg, emph, hl, src });
+                    cells.push(Cell { ch: ' ', w: 1, fg, emph, hl, src, kind: None });
                     col += 1;
                 }
             } else {
                 let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-                cells.push(Cell { ch, w, fg, emph, hl, src });
+                cells.push(Cell { ch, w, fg, emph, hl, src, kind: None });
                 col += w;
             }
             idx += 1;
@@ -2349,6 +2376,7 @@ fn code_cells(row: &Row, emph_on: bool, hl_ranges: &[(u32, u32)], marker_fg: Col
             emph: emph_on,
             hl: false,
             src,
+            kind: None,
         }));
     }
     cells
@@ -2360,22 +2388,36 @@ fn plain_cells(row: &Row) -> Vec<Cell> {
 }
 
 /// Spans from cells, merging equal runs; a find match takes `hl`, emphasis `emph_bg`.
-fn cells_to_spans(cells: &[Cell], emph_bg: Color, hl: Style) -> Vec<Span<'static>> {
+fn cells_to_spans(
+    cells: &[Cell],
+    emph_bg: Color,
+    hl: Style,
+    comment_fg: Color,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut buf = String::new();
-    let mut cur: Option<(Color, bool, bool)> = None;
+    let mut cur: Option<(Color, bool, bool, Option<CommentKind>)> = None;
     for c in cells {
-        let key = (c.fg, c.emph, c.hl);
+        let key = (c.fg, c.emph, c.hl, c.kind);
         if cur != Some(key) {
-            if let Some((fg, emph, is_hl)) = cur {
-                spans.push(cell_span(std::mem::take(&mut buf), fg, emph, is_hl, emph_bg, hl));
+            if let Some((fg, emph, is_hl, kind)) = cur {
+                spans.push(cell_span(
+                    std::mem::take(&mut buf),
+                    fg,
+                    emph,
+                    is_hl,
+                    emph_bg,
+                    hl,
+                    kind,
+                    comment_fg,
+                ));
             }
             cur = Some(key);
         }
         buf.push(c.ch);
     }
-    if let Some((fg, emph, is_hl)) = cur {
-        spans.push(cell_span(buf, fg, emph, is_hl, emph_bg, hl));
+    if let Some((fg, emph, is_hl, kind)) = cur {
+        spans.push(cell_span(buf, fg, emph, is_hl, emph_bg, hl, kind, comment_fg));
     }
     spans
 }
@@ -2396,14 +2438,24 @@ fn cell_span(
     is_hl: bool,
     emph_bg: Color,
     hl: Style,
+    kind: Option<CommentKind>,
+    comment_fg: Color,
 ) -> Span<'static> {
-    let style = if is_hl {
+    let mut style = if is_hl {
         hl
     } else if emph {
         Style::default().fg(fg).bg(emph_bg)
     } else {
         Style::default().fg(fg)
     };
+    match kind {
+        Some(CommentKind::Delete) => style = style.add_modifier(Modifier::CROSSED_OUT),
+        Some(CommentKind::LooksGood) => style = style.add_modifier(Modifier::UNDERLINED),
+        Some(CommentKind::Comment) => {
+            style = style.fg(comment_fg).add_modifier(Modifier::UNDERLINED);
+        }
+        None => {}
+    }
     Span::styled(text, style)
 }
 
@@ -2447,7 +2499,170 @@ fn render_find_band(frame: &mut Frame, app: &App, area: Rect) {
     anchor_input_cursor(frame, area, label.width() + caret_cell_col, 0);
 }
 
+/// Annotate-style padded labels. `✗` is text, not the color-emoji `❌` badge.
+const TOOLBAR_LOOKS_LABEL: &str = " 👍 looks good";
+const TOOLBAR_DELETE_LABEL: &str = " ✗ delete";
+
+/// Xs of the two labels. A span starts at the last char; a whole line starts at `code_left`.
+fn toolbar_pair_xs(last_char: Option<(u16, u16)>, code_left: u16) -> (u16, u16) {
+    let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
+    match last_char {
+        Some((x, _)) => (x, x + looks_w),
+        None => (code_left, code_left + looks_w),
+    }
+}
+
+/// The first selected row the Kind toolbar sits above.
+fn toolbar_first_row(app: &App) -> usize {
+    if let Some(drag) = app.settled_selection()
+        && drag.surface == crate::selection::Surface::Read
+    {
+        return drag.ordered().0.row.min(app.visible.len().saturating_sub(1));
+    }
+    app.selection_range().0
+}
+
+/// Wrap segment and in-segment screen x of `chr` on `row`.
+fn char_visual(
+    app: &App,
+    row: &Row,
+    chr: usize,
+    pane_x: u16,
+    prefix_w: usize,
+    code_width: usize,
+) -> Option<(usize, u16, u16)> {
+    let cells = plain_cells(row);
+    let segs = if app.wrap && !matches!(row, Row::Rendered { .. }) {
+        wrap_segments(&cells, code_width.max(1), ContinuationSpaces::Trim)
+    } else {
+        vec![(0, cells.len())]
+    };
+    let (seg, (s, e)) = segs.into_iter().enumerate().find(|(_, (s, e))| {
+        cells.get(*s..*e).is_some_and(|slice| slice.iter().any(|c| c.src == chr))
+    })?;
+    let col: usize = cells[s..e].iter().take_while(|c| c.src < chr).map(|c| c.w).sum();
+    let w = cells[s..e].iter().find(|c| c.src == chr).map(|c| c.w).unwrap_or(1);
+    // Unwrap paints `h_scroll` away; the bar must use the same visible column.
+    let col = if app.wrap { col } else { col.saturating_sub(app.h_scroll) };
+    let x = pane_x.saturating_add(prefix_w as u16).saturating_add(col as u16);
+    Some((seg, x, w as u16))
+}
+
+/// Screen x and width of the settled span's last character, if any.
+fn last_char_screen(
+    app: &App,
+    pane_x: u16,
+    prefix_w: usize,
+    code_width: usize,
+) -> Option<(u16, u16)> {
+    let drag = app.settled_selection()?;
+    if drag.surface != crate::selection::Surface::Read {
+        return None;
+    }
+    let b = drag.ordered().1;
+    let row = app.visible.get(b.row)?;
+    char_visual(app, row, b.chr, pane_x, prefix_w, code_width).map(|(_, x, w)| (x, w))
+}
+
+/// Shift `x` left so a width-2 glyph at `x-1` cannot skip the first chip cell on flush.
+fn snap_chip_left(buf: &ratatui::buffer::Buffer, y: u16, mut x: u16, min_x: u16) -> u16 {
+    while x > min_x && UnicodeWidthStr::width(buf[(x - 1, y)].symbol()) > 1 {
+        x -= 1;
+    }
+    x
+}
+
+/// Exclusive end: if the last cell is a width-2 glyph, include its follow cell.
+fn snap_chip_right(buf: &ratatui::buffer::Buffer, y: u16, end: u16, max_x: u16) -> u16 {
+    let end = end.min(max_x);
+    if end == 0 || end >= max_x {
+        return end;
+    }
+    if UnicodeWidthStr::width(buf[(end - 1, y)].symbol()) > 1 {
+        return (end + 1).min(max_x);
+    }
+    end
+}
+
+/// Exclusive chip end after the labels, including the right pad (before CJK snap).
+fn toolbar_chip_end(looks_x: u16, pair_w: u16, max_x: u16) -> u16 {
+    looks_x.saturating_add(pair_w).saturating_add(1).min(max_x)
+}
+
+fn toolbar_xs(app: &App, inner: Rect, prefix_w: usize) -> (u16, u16) {
+    let code_left = inner.x.saturating_add(prefix_w as u16);
+    let code_width = (inner.width as usize).saturating_sub(prefix_w).max(1);
+    let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
+    let pair_w = looks_w + TOOLBAR_DELETE_LABEL.width() as u16;
+    let (looks, _) =
+        toolbar_pair_xs(last_char_screen(app, inner.x, prefix_w, code_width), code_left);
+    // A last-char past the pane (unwrap, or a wrap-edge CJK) must not spill onto the next row.
+    // Do not push left to `code_left`: 👍 may sit a cell into the gutter to center on the last char.
+    let max_looks = inner.x.saturating_add(inner.width).saturating_sub(pair_w);
+    let looks = looks.min(max_looks);
+    (looks, looks + looks_w)
+}
+
+/// Screen y of the floating Kind toolbar: the row above the first selected wrap segment.
+fn kind_toolbar_y(inner: Rect, app: &App, slots: &[Slot]) -> Option<u16> {
+    if !matches!(app.mode, Mode::Composing { editing: None }) {
+        return None;
+    }
+    let first = toolbar_first_row(app);
+    let prefix_w = gutter_prefix_width(gutter_for(&app.diff));
+    let code_width = (inner.width as usize).saturating_sub(prefix_w).max(1);
+    let seg = app
+        .settled_selection()
+        .filter(|d| d.surface == crate::selection::Surface::Read)
+        .and_then(|d| {
+            let a = d.ordered().0;
+            let row = app.visible.get(a.row)?;
+            char_visual(app, row, a.chr, inner.x, prefix_w, code_width).map(|(seg, _, _)| seg)
+        })
+        .unwrap_or(0);
+    let idx = slots
+        .iter()
+        .position(|s| matches!(s, Slot::Code { row, seg: sg } if *row == first && *sg == seg))?;
+    let line_y = inner.y.saturating_add(idx as u16);
+    Some(line_y.saturating_sub(1))
+}
+
+fn render_kind_toolbar(frame: &mut Frame, app: &App, inner: Rect, slots: &[Slot]) {
+    let Some(y) = kind_toolbar_y(inner, app, slots) else {
+        return;
+    };
+    let prefix_w = gutter_prefix_width(gutter_for(&app.diff));
+    let (looks_x, del_x) = toolbar_xs(app, inner, prefix_w);
+    let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
+    let del_w = TOOLBAR_DELETE_LABEL.width() as u16;
+    let pair_w = looks_w + del_w;
+    let max_x = inner.x.saturating_add(inner.width);
+    let tentative_end = toolbar_chip_end(looks_x, pair_w, max_x);
+    let x = snap_chip_left(frame.buffer_mut(), y, looks_x, inner.x);
+    let end = snap_chip_right(frame.buffer_mut(), y, tentative_end, max_x);
+    let width = end.saturating_sub(x).max(1);
+    let area = Rect { x, y, width, height: 1 };
+    let p = app.palette();
+    let bg = p.fill(Fill::Bar);
+    // Annotate: Clear + one bg + padded labels. set_span reset()s the cell after 👍;
+    // on a green/red diff that hole shows the selection, so the bar looks shifted.
+    frame.render_widget(Clear, area);
+    let buf = frame.buffer_mut();
+    let fill = Style::default().bg(bg);
+    for dx in 0..area.width {
+        buf[(area.x + dx, y)].set_char(' ').set_style(fill);
+    }
+    let looks_style =
+        Style::default().fg(p.ink(Ink::Success, Fill::Bar)).bg(bg).add_modifier(Modifier::BOLD);
+    let del_style =
+        Style::default().fg(p.ink(Ink::Danger, Fill::Bar)).bg(bg).add_modifier(Modifier::BOLD);
+    buf.set_span(looks_x, y, &Span::styled(TOOLBAR_LOOKS_LABEL, looks_style), looks_w);
+    buf.set_span(del_x, y, &Span::styled(TOOLBAR_DELETE_LABEL, del_style), del_w);
+    buf.set_style(area, fill);
+}
+
 /// The inline comment input box, drawn at `area` (under the selection in the diff).
+
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let loc = app.pending_location().unwrap_or_else(|| "comment".to_string());
@@ -2513,6 +2728,41 @@ pub fn age_label(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_span_toolbar_starts_at_the_last_char() {
+        let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
+        assert_eq!(toolbar_pair_xs(Some((40, 1)), 4), (40, 40 + looks_w));
+    }
+
+    #[test]
+    fn a_whole_line_toolbar_starts_at_the_code_left() {
+        let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
+        assert_eq!(toolbar_pair_xs(None, 7), (7, 7 + looks_w));
+    }
+
+    #[test]
+    fn a_chip_start_eats_the_wide_char_that_would_skip_into_it() {
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 8, 1));
+        buf.set_string(0, 0, "这ab", Style::default());
+        assert_eq!(snap_chip_left(&buf, 0, 1, 0), 0);
+        assert_eq!(snap_chip_left(&buf, 0, 2, 0), 2);
+    }
+
+    #[test]
+    fn a_chip_end_eats_the_wide_char_it_would_split() {
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 8, 1));
+        buf.set_string(0, 0, "ab这", Style::default());
+        assert_eq!(snap_chip_right(&buf, 0, 3, 8), 4);
+        assert_eq!(snap_chip_right(&buf, 0, 2, 8), 2);
+        assert_eq!(snap_chip_right(&buf, 0, 4, 8), 4);
+    }
+
+    #[test]
+    fn a_chip_end_keeps_a_pad_after_delete() {
+        assert_eq!(toolbar_chip_end(10, 20, 80), 31);
+        assert_eq!(toolbar_chip_end(70, 20, 80), 80);
+    }
 
     #[test]
     fn a_stamp_ahead_of_this_clock_reads_now_until_a_second_past_it() {
@@ -3042,10 +3292,15 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
                 format!(" {}", c.location()),
                 Style::default().fg(p.ink(Ink::Comment, on)).add_modifier(Modifier::BOLD),
             );
-            let mut spans = vec![loc, Span::styled(format!("  {}", c.text), text_style(p, on))];
+            let mut spans =
+                vec![loc, Span::styled(format!("  {}", c.card_text()), text_style(p, on))];
             // A comment whose anchor may have moved is flagged, never dropped.
             if app.is_stale(c) {
                 spans.push(Span::styled("  (stale)", Style::default().fg(p.ink(Ink::Warning, on))));
+            }
+            if c.sent {
+                spans
+                    .push(Span::styled("  (sent)", Style::default().fg(p.ink(Ink::TextMuted, on))));
             }
             // The list overlay is the active modal, so its row reads at full brightness.
             selectable_row(p, spans, width, on)
@@ -3185,6 +3440,30 @@ fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     frame.render_widget(List::new(items), inner);
+}
+
+/// The new-compose toolbar button under the pointer, if any.
+#[must_use]
+pub fn hit_composer_toolbar(area: Rect, app: &App, col: u16, row: u16) -> Option<CommentKind> {
+    if !matches!(app.mode, Mode::Composing { editing: None }) {
+        return None;
+    }
+    let pane = read_pane(area, app);
+    let slots = read_layout(app, pane.inner, &app.card_rows());
+    let y = kind_toolbar_y(pane.inner, app, &slots)?;
+    if row != y {
+        return None;
+    }
+    let (looks_x, del_x) = toolbar_xs(app, pane.inner, pane.prefix_w);
+    let looks_w = TOOLBAR_LOOKS_LABEL.width() as u16;
+    let del_w = TOOLBAR_DELETE_LABEL.width() as u16;
+    if col >= looks_x && col < looks_x.saturating_add(looks_w) {
+        return Some(CommentKind::LooksGood);
+    }
+    if col >= del_x && col < del_x.saturating_add(del_w) {
+        return Some(CommentKind::Delete);
+    }
+    None
 }
 
 /// The picker row under the pointer, for click-to-highlight.
@@ -4732,6 +5011,7 @@ fn push_finding_quote(
                 selected: false,
                 hovered: false,
                 lead: false,
+                kind_comments: Vec::new(),
             };
             lines.extend(render_row(row, layout, state));
         }

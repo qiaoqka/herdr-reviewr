@@ -1,13 +1,16 @@
-//! Comments formatted as `location`, snippet, text, and exported; the caller consumes on `Ok`.
+//! Comments formatted for the agent, grouped by file; send marks pending sent on `Ok`, copy does not.
 
 use anyhow::Result;
 
 use crate::herdr;
-use crate::model::Comment;
+use crate::model::{Comment, CommentKind, Side};
 
-/// One comment as its export block: location, snippet, then text.
+/// Inclusive–inclusive line ranges and exclusive end columns use this dash.
+const RANGE: &str = "–";
+
+/// One comment as an `Annotation` block, numbered `1` when exported alone.
 pub fn format_comment(comment: &Comment) -> String {
-    format!("{}\n{}\n{}", comment.location(), comment.lines, normalize_text(&comment.text))
+    format_annotation(1, comment)
 }
 
 /// Comment text without blank lines, which would read as the separator between comments.
@@ -20,11 +23,90 @@ fn normalize_text(text: &str) -> String {
         .join("\n")
 }
 
-/// Many comments, sorted by file then start line, one blank line between blocks.
+fn lines_clause(comment: &Comment) -> String {
+    let span = match (comment.start_col, comment.end_col) {
+        (Some(start_col), Some(end_col)) => {
+            format!("{}:{start_col}{RANGE}{}:{end_col}", comment.start, comment.end)
+        }
+        _ if comment.start == comment.end => comment.start.to_string(),
+        _ => format!("{}{RANGE}{}", comment.start, comment.end),
+    };
+    if comment.side == Side::Old { format!("{span}, removed") } else { span }
+}
+
+fn excerpt_text(comment: &Comment) -> String {
+    if comment.start_col.is_some() {
+        return comment.lines.clone();
+    }
+    comment
+        .lines
+        .lines()
+        .map(|line| match line.chars().next() {
+            Some('+' | '-' | ' ') => line.chars().skip(1).collect(),
+            _ => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_annotation(n: usize, comment: &Comment) -> String {
+    let mut out = format!("### Annotation {n} (lines {})", lines_clause(comment));
+    match comment.kind {
+        CommentKind::LooksGood | CommentKind::Delete => {
+            let tag = match comment.kind {
+                CommentKind::LooksGood => "Looks good",
+                CommentKind::Delete => "Remove this",
+                CommentKind::Comment => unreachable!(),
+            };
+            if comment.start_col.is_some() {
+                let excerpt = excerpt_text(comment).replace('"', "\\\"");
+                out.push_str(&format!("\n{tag}: \"{excerpt}\""));
+            } else {
+                out.push_str(&format!("\n{tag}"));
+            }
+        }
+        CommentKind::Comment => {
+            if comment.side == Side::Old || comment.start_col.is_some() {
+                let excerpt = excerpt_text(comment).replace('"', "\\\"");
+                out.push_str(&format!("\nComment on: \"{excerpt}\""));
+            }
+            let text = normalize_text(&comment.text);
+            if !text.is_empty() {
+                out.push('\n');
+                out.push_str(
+                    &text.lines().map(|line| format!("> {line}")).collect::<Vec<_>>().join("\n"),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Many comments: a header, then one `##` file with numbered annotations.
 pub fn format_all(comments: &[&Comment]) -> String {
+    if comments.is_empty() {
+        return String::new();
+    }
     let mut sorted = comments.to_vec();
-    sorted.sort_by(|a, b| a.file.cmp(&b.file).then(a.start.cmp(&b.start)));
-    sorted.iter().map(|c| format_comment(c)).collect::<Vec<_>>().join("\n\n")
+    sorted.sort_by(|a, b| {
+        a.file.cmp(&b.file).then(a.start.cmp(&b.start)).then(a.start_col.cmp(&b.start_col))
+    });
+    let mut out = String::from("审阅意见如下:\n");
+    let mut current: Option<&str> = None;
+    let mut n = 0usize;
+    for c in sorted {
+        if current != Some(c.file.as_str()) {
+            current = Some(c.file.as_str());
+            n = 0;
+            out.push_str(&format!("\n## {}\n", c.file));
+        }
+        n += 1;
+        out.push('\n');
+        out.push_str(&format_annotation(n, c));
+        out.push('\n');
+    }
+    out.pop();
+    out
 }
 
 /// A destination comments can be exported to. Export succeeds or errors as a whole.
@@ -35,6 +117,11 @@ pub trait ExportTarget {
     fn success_message(&self, count: usize) -> String;
     /// The status after a failed export, `copy` naming the copy key; the cause goes to the log.
     fn failure_message(&self, error: &anyhow::Error, copy: &str) -> String;
+    /// Whether a successful export removes the comments from the store.
+    /// Send does; clipboard copy does not, so the reviewer can still edit.
+    fn consumes_comments(&self) -> bool {
+        true
+    }
 }
 
 /// The status for a failed send to `agent`: the cause first, since a narrow pane keeps only the
@@ -79,6 +166,10 @@ impl ExportTarget for Clipboard {
 
     fn export(&self, text: &str) -> Result<()> {
         clipboard::write(text)
+    }
+
+    fn consumes_comments(&self) -> bool {
+        false
     }
 }
 
@@ -199,7 +290,7 @@ impl ExportTarget for Agent {
 #[cfg(test)]
 mod tests {
     use super::{Agent, Clipboard, ExportTarget, format_all, format_comment, send_failure};
-    use crate::model::{Comment, Side};
+    use crate::model::{Comment, CommentKind, Side};
 
     #[cfg(not(windows))]
     #[test]
@@ -283,13 +374,12 @@ mod tests {
             end,
             lines: lines.into(),
             text: text.into(),
-            diff_anchored: true,
-            rev: crate::model::Rev::Worktree,
+            ..Comment::default()
         }
     }
 
     #[test]
-    fn block_is_location_snippet_text() {
+    fn a_whole_line_range_skips_the_excerpt() {
         let c = comment(
             "extruct/core/llm_registry.py",
             Side::New,
@@ -300,28 +390,84 @@ mod tests {
         );
         assert_eq!(
             format_comment(&c),
-            "extruct/core/llm_registry.py:40-41\n-from .z import w\n+from .x import y\nthis import path looks wrong"
+            "### Annotation 1 (lines 40–41)\n> this import path looks wrong"
         );
     }
 
     #[test]
-    fn removed_side_marks_the_header() {
+    fn removed_side_quotes_the_deleted_text() {
         let c = comment("a.rs", Side::Old, 38, 38, "-    cleanup()", "still needed");
-        assert_eq!(format_comment(&c), "a.rs:38 (removed)\n-    cleanup()\nstill needed");
+        assert_eq!(
+            format_comment(&c),
+            "### Annotation 1 (lines 38, removed)\nComment on: \"    cleanup()\"\n> still needed"
+        );
+    }
+
+    #[test]
+    fn a_character_span_uses_line_col_and_excerpt() {
+        let mut c =
+            comment("feat.feature", Side::New, 12, 12, "review-fix-loop", "拆到三个 Feature");
+        c.start_col = Some(21);
+        c.end_col = Some(36);
+        assert_eq!(
+            format_comment(&c),
+            "### Annotation 1 (lines 12:21–12:36)\nComment on: \"review-fix-loop\"\n> 拆到三个 Feature"
+        );
     }
 
     #[test]
     fn multiline_text_keeps_breaks_but_drops_blank_lines() {
         let c = comment("a.rs", Side::New, 1, 1, "+x", "first line\n\n  \nsecond line\n");
-        assert_eq!(format_comment(&c), "a.rs:1\n+x\nfirst line\nsecond line");
+        assert_eq!(format_comment(&c), "### Annotation 1 (lines 1)\n> first line\n> second line");
     }
 
     #[test]
-    fn all_sorts_by_file_then_start_with_blank_separator() {
+    fn all_groups_by_file_and_numbers_per_file() {
         let b = comment("b.rs", Side::New, 5, 5, "+x", "two");
         let a2 = comment("a.rs", Side::New, 20, 20, "+y", "later");
         let a1 = comment("a.rs", Side::New, 3, 3, "+z", "earlier");
         let out = format_all(&[&b, &a2, &a1]);
-        assert_eq!(out, "a.rs:3\n+z\nearlier\n\na.rs:20\n+y\nlater\n\nb.rs:5\n+x\ntwo");
+        assert_eq!(
+            out,
+            "审阅意见如下:\n\n## a.rs\n\n### Annotation 1 (lines 3)\n> earlier\n\n### Annotation 2 (lines 20)\n> later\n\n## b.rs\n\n### Annotation 1 (lines 5)\n> two"
+        );
+    }
+
+    #[test]
+    fn a_looks_good_span_quotes_the_excerpt() {
+        let mut c = comment("feat.feature", Side::New, 77, 77, "圈中的字", "");
+        c.start_col = Some(50);
+        c.end_col = Some(93);
+        c.kind = CommentKind::LooksGood;
+        assert_eq!(
+            format_comment(&c),
+            "### Annotation 1 (lines 77:50–77:93)\nLooks good: \"圈中的字\""
+        );
+    }
+
+    #[test]
+    fn a_whole_line_looks_good_has_no_colon_or_excerpt() {
+        let mut c = comment("a.rs", Side::New, 76, 76, "+long line of code", "");
+        c.kind = CommentKind::LooksGood;
+        assert_eq!(format_comment(&c), "### Annotation 1 (lines 76)\nLooks good");
+    }
+
+    #[test]
+    fn a_delete_span_quotes_the_excerpt() {
+        let mut c = comment("a.rs", Side::Old, 77, 77, "无 Feature 句式规范", "");
+        c.start_col = Some(13);
+        c.end_col = Some(27);
+        c.kind = CommentKind::Delete;
+        assert_eq!(
+            format_comment(&c),
+            "### Annotation 1 (lines 77:13–77:27, removed)\nRemove this: \"无 Feature 句式规范\""
+        );
+    }
+
+    #[test]
+    fn a_whole_line_delete_has_no_colon_or_excerpt() {
+        let mut c = comment("a.rs", Side::Old, 38, 38, "-    cleanup()", "");
+        c.kind = CommentKind::Delete;
+        assert_eq!(format_comment(&c), "### Annotation 1 (lines 38, removed)\nRemove this");
     }
 }

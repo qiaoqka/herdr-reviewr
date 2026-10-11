@@ -3221,6 +3221,21 @@ impl App {
         self.settled_sel = None;
     }
 
+    /// Take the settled span so a later action can put it back (Comment keeps it).
+    pub(crate) fn take_settled_selection(
+        &mut self,
+    ) -> Option<(crate::selection::TextDrag, String)> {
+        self.settled_sel.take()
+    }
+
+    /// Restore a span taken before a key that must not drop it.
+    pub(crate) fn restore_settled_selection(
+        &mut self,
+        sel: Option<(crate::selection::TextDrag, String)>,
+    ) {
+        self.settled_sel = sel;
+    }
+
     /// Whether world events leave the open view alone: under a modal or a view-anchored gesture.
     fn view_frozen(&self) -> bool {
         self.mode.is_modal() || self.view_anchored_gesture()
@@ -3369,6 +3384,14 @@ impl App {
 
     pub fn start_comment(&mut self) {
         if self.focus == Focus::Diff && self.has_anchorable_selection() {
+            // A character span splices the box under the selected +/- row, not the last cursor.
+            if let Some((drag, _)) = self.text_comment_span() {
+                let (_, b) = drag.ordered();
+                if b.row < self.visible.len() {
+                    self.diff_cursor = b.row;
+                    self.select_anchor = None;
+                }
+            }
             self.reveal_diff = true; // scroll the anchored line into view before the box opens
             self.input.clear();
             self.caret = 0;
@@ -3699,6 +3722,7 @@ impl App {
     }
 
     pub fn cancel_comment(&mut self) {
+        // Keep the highlight so Esc can reopen the same span with `c`.
         self.leave_compose();
     }
 
@@ -3739,6 +3763,30 @@ impl App {
             }
         }
         self.select_anchor = None;
+        self.clear_settled_selection();
+        self.leave_compose();
+        self.refresh_rendered();
+    }
+
+    /// Submit a toolbar tag with empty body. Only a new compose accepts it.
+    pub fn submit_kind(&mut self, kind: crate::model::CommentKind) {
+        let Mode::Composing { editing: None } = self.mode else { return };
+        match self.build_comment(String::new()) {
+            Some(mut c) => {
+                c.kind = kind;
+                c.text.clear();
+                logln!("comment add {} :: {:?}", c.location(), c.kind);
+                let i = self.store.add(c);
+                self.target_comment_card(i);
+                self.status = "comment added".to_string();
+            }
+            None => {
+                self.cancel_comment();
+                return;
+            }
+        }
+        self.select_anchor = None;
+        self.clear_settled_selection();
         self.leave_compose();
         self.refresh_rendered();
     }
@@ -3753,11 +3801,24 @@ impl App {
 
     /// Whether the selection holds a row a comment can attach to.
     fn has_anchorable_selection(&self) -> bool {
+        if self.text_comment_span().is_some() {
+            return true;
+        }
         if self.rendered.on_screen() {
             return self.selection_anchor().is_some();
         }
         let (lo, hi) = self.selection_range();
         self.visible.get(lo..=hi).is_some_and(|s| s.iter().any(Row::is_content))
+    }
+
+    /// A settled Read drag that still has selected text, for a character-span comment.
+    fn text_comment_span(&self) -> Option<(crate::selection::TextDrag, String)> {
+        use crate::selection::Surface;
+        let (drag, text) = self.settled_sel.as_ref()?;
+        if drag.surface != Surface::Read || text.is_empty() {
+            return None;
+        }
+        Some((*drag, text.clone()))
     }
 
     /// The selection's `(side, start, end, snippet)`, rendered or not, by one `anchor()` (G1).
@@ -3815,12 +3876,41 @@ impl App {
     fn build_comment(&self, text: String) -> Option<Comment> {
         // The open diff's file, never the list selection.
         let file = self.diff_path.clone()?;
-        let (side, start, end, lines) = self.selection_anchor()?;
+        let (side, start, end, start_col, end_col, lines) =
+            if let Some((drag, excerpt)) = self.text_comment_span() {
+                let (a, b) = drag.ordered();
+                let hi = b.row.min(self.visible.len().saturating_sub(1));
+                let (side, start, end, _) = anchor(self.visible.get(a.row..=hi)?)?;
+                (
+                    side,
+                    start,
+                    end,
+                    Some((a.chr as u32).saturating_add(1)),
+                    Some((b.chr as u32).saturating_add(2)),
+                    excerpt,
+                )
+            } else {
+                let (side, start, end, lines) = self.selection_anchor()?;
+                (side, start, end, None, None, lines)
+            };
         // A File view comment is content-anchored: it goes stale only with its file.
         let diff_anchored = self.diff.view == View::Diff;
         // A content comment reads the worktree whatever the scope.
         let rev = if diff_anchored { self.current_rev() } else { Rev::Worktree };
-        Some(Comment { file, side, start, end, lines, text, diff_anchored, rev })
+        Some(Comment {
+            file,
+            side,
+            start,
+            end,
+            start_col,
+            end_col,
+            lines,
+            text,
+            kind: crate::model::CommentKind::Comment,
+            sent: false,
+            diff_anchored,
+            rev,
+        })
     }
 
     /// The composer's `path:line`, while composing.
@@ -3831,16 +3921,7 @@ impl App {
                 let file = self.diff_path.clone()?;
                 let (side, start, end, _) = self.selection_anchor()?;
                 // Only `location()` is read here, which ignores `diff_anchored`.
-                let c = Comment {
-                    file,
-                    side,
-                    start,
-                    end,
-                    lines: String::new(),
-                    text: String::new(),
-                    diff_anchored: true,
-                    rev: Rev::Worktree,
-                };
+                let c = Comment { file, side, start, end, ..Comment::default() };
                 Some(c.location())
             }
             Mode::Normal
@@ -3932,6 +4013,22 @@ impl App {
                 owner.into_iter().collect()
             }
         }
+    }
+
+    /// Comments covering visible row `li`, for Kind decorations on that row.
+    #[must_use]
+    pub fn kind_comments_on_row(&self, li: usize) -> Vec<Comment> {
+        let Some(file) = self.diff_path.as_deref() else {
+            return Vec::new();
+        };
+        let Some(row) = self.visible.get(li) else {
+            return Vec::new();
+        };
+        self.store
+            .iter()
+            .filter(|c| c.file == file && self.comment_in_view(c) && line_in(c, row))
+            .cloned()
+            .collect()
     }
 
     /// The card anchors and every commented row, from one walk.
@@ -5106,19 +5203,30 @@ impl App {
         }
     }
 
-    /// Export every comment to `target`, consuming them only on success, which it returns.
+    /// Export comments to `target`. A consuming target (send) takes only pending
+    /// comments and marks them sent; copy takes the whole set and leaves `sent` alone.
     pub fn export(&mut self, target: &dyn ExportTarget) -> bool {
         if self.store.is_empty() {
             self.status = "no comments yet".to_string();
             return false;
         }
-        let refs: Vec<&Comment> = self.store.iter().collect();
-        let text = format_all(&refs);
-        let n = refs.len();
+        let sending: Vec<&Comment> = if target.consumes_comments() {
+            self.store.iter().filter(|c| !c.sent).collect()
+        } else {
+            self.store.iter().collect()
+        };
+        if sending.is_empty() {
+            self.status = "no new comments".to_string();
+            return false;
+        }
+        let text = format_all(&sending);
+        let n = sending.len();
         logln!("export ({n}) -> {} ::\n{text}", target.label());
         let delivered = match target.export(&text) {
             Ok(()) => {
-                self.store.take_all();
+                if target.consumes_comments() {
+                    self.store.mark_pending_sent();
+                }
                 self.status = target.success_message(n);
                 logln!("export OK");
                 true
@@ -5146,11 +5254,11 @@ impl App {
         }
     }
 
-    /// What a quit would drop: the comments, plus a non-empty new draft.
+    /// What a quit would drop: pending comments, plus a non-empty new draft.
     pub fn unsent(&self) -> usize {
         let draft =
             matches!(self.mode, Mode::Composing { editing: None }) && !self.input.trim().is_empty();
-        self.store.len() + usize::from(draft)
+        self.store.pending_count() + usize::from(draft)
     }
 
     /// Whether the footer is the `Normal` bar with `?` and bands.
@@ -5489,7 +5597,7 @@ fn anchor(selected: &[Row]) -> Option<(Side, u32, u32, String)> {
 mod tests {
     use super::{App, Mode};
     use crate::config::NavigatorPosition;
-    use crate::model::{Comment, CommitPick, Scope, Side};
+    use crate::model::{Comment, CommitPick, Scope};
     use crate::test_support::test_repo;
     use crate::world::{PickStatus, PickVerdict};
     use std::path::PathBuf;
@@ -5733,13 +5841,11 @@ mod tests {
         let mut old = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
         old.store.add(Comment {
             file: "src/lib.rs".to_string(),
-            side: Side::New,
             start: 1,
             end: 1,
             lines: "+line".to_string(),
             text: "saved".to_string(),
-            diff_anchored: true,
-            rev: crate::model::Rev::Worktree,
+            ..Comment::default()
         });
         old.mode = Mode::Composing { editing: None };
         old.resume_list = true;
@@ -6026,13 +6132,11 @@ mod tests {
         let mut app = edit_app();
         app.store.add(crate::model::Comment {
             file: "src/lib.rs".into(),
-            side: Side::New,
             start: 12,
             end: 12,
             lines: "+x".into(),
             text: "note".into(),
-            diff_anchored: true,
-            rev: crate::model::Rev::Worktree,
+            ..Comment::default()
         });
         app.diff_cursor = 2;
         app.start_edit();
@@ -6057,13 +6161,11 @@ mod tests {
         let mut app = edit_app();
         app.store.add(crate::model::Comment {
             file: "src/lib.rs".into(),
-            side: Side::New,
             start: 1,
             end: 1,
             lines: "+x".into(),
             text: "note".into(),
-            diff_anchored: true,
-            rev: crate::model::Rev::Worktree,
+            ..Comment::default()
         });
         app.rendered.content =
             Some(crate::rendered::Content { text: "# heading".into(), old: None, nothing: false });
@@ -6082,13 +6184,11 @@ mod tests {
         let mut app = edit_app();
         app.store.add(crate::model::Comment {
             file: "src/lib.rs".into(),
-            side: Side::New,
             start: 12,
             end: 12,
             lines: "+x".into(),
             text: "note".into(),
-            diff_anchored: true,
-            rev: crate::model::Rev::Worktree,
+            ..Comment::default()
         });
         app.diff_cursor = 2;
         app.toggle_select();
@@ -6111,13 +6211,11 @@ mod tests {
         let mut app = edit_app();
         app.store.add(crate::model::Comment {
             file: "src/lib.rs".into(),
-            side: Side::New,
             start: 12,
             end: 12,
             lines: "+x".into(),
             text: "note".into(),
-            diff_anchored: true,
-            rev: crate::model::Rev::Worktree,
+            ..Comment::default()
         });
         app.diff_cursor = 2;
         app.tab = super::Tab::Pr;
@@ -6132,13 +6230,11 @@ mod tests {
         let mut app = edit_app();
         app.store.add(crate::model::Comment {
             file: "src/lib.rs".into(),
-            side: Side::New,
             start: 10,
             end: 10,
             lines: "+x".into(),
             text: "note".into(),
-            diff_anchored: true,
-            rev: crate::model::Rev::Worktree,
+            ..Comment::default()
         });
         app.diff_cursor = 0;
         app.focus = crate::Focus::Files;

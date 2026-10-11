@@ -13,7 +13,7 @@ use herdr_reviewr::diff::{Bar, MarkerKind, RenderedKind, Row};
 use herdr_reviewr::export::ExportTarget;
 use herdr_reviewr::herdr::{AgentChoice, AgentSample};
 use herdr_reviewr::keymap::{Action, Key, KeyCode as BindingCode, Keymap};
-use herdr_reviewr::model::{Scope, Side};
+use herdr_reviewr::model::{CommentKind, Scope, Side};
 use herdr_reviewr::turn::Status;
 use herdr_reviewr::{handle_key, handle_mouse};
 use ratatui::crossterm::event::{
@@ -24,15 +24,19 @@ use ratatui::layout::Rect;
 /// An export target that records what it was handed and can be made to fail.
 struct FakeTarget {
     ok: bool,
+    consumes: bool,
     captured: RefCell<Vec<String>>,
 }
 
 impl FakeTarget {
     fn ok() -> Self {
-        Self { ok: true, captured: RefCell::new(Vec::new()) }
+        Self { ok: true, consumes: true, captured: RefCell::new(Vec::new()) }
     }
     fn failing() -> Self {
-        Self { ok: false, captured: RefCell::new(Vec::new()) }
+        Self { ok: false, consumes: true, captured: RefCell::new(Vec::new()) }
+    }
+    fn copying() -> Self {
+        Self { ok: true, consumes: false, captured: RefCell::new(Vec::new()) }
     }
     fn last(&self) -> String {
         self.captured.borrow().last().cloned().unwrap_or_default()
@@ -53,6 +57,9 @@ impl ExportTarget for FakeTarget {
     fn export(&self, text: &str) -> Result<()> {
         self.captured.borrow_mut().push(text.to_string());
         if self.ok { Ok(()) } else { bail!("fake export failure") }
+    }
+    fn consumes_comments(&self) -> bool {
+        self.consumes
     }
 }
 
@@ -666,6 +673,30 @@ fn comment_on(app: &mut App, marker: char, text: &str) {
     app.submit_comment();
 }
 
+/// Click the composer toolbar cell that submits `kind`.
+fn click_toolbar(app: &mut App, kind: CommentKind) {
+    let area = Rect::new(0, 0, 120, 40);
+    let heights = vec![1usize; app.visible.len()];
+    let (col, row) = (0..area.height)
+        .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| herdr_reviewr::ui::hit_composer_toolbar(area, app, x, y) == Some(kind))
+        .expect("toolbar button is clickable");
+    handle_mouse(
+        app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &heights,
+        &Keymap::default(),
+        &herdr_reviewr::export::Clipboard,
+    )
+    .unwrap();
+}
+
 /// An app sitting in the comment composer on the first changed line, caret at 0.
 fn composing_app() -> App {
     let r = edited_repo();
@@ -674,6 +705,367 @@ fn composing_app() -> App {
     app.diff_cursor = row_with(&app, '+');
     app.start_comment();
     app
+}
+
+#[test]
+fn a_toolbar_click_submits_looks_good_without_text() {
+    let mut app = composing_app();
+    click_toolbar(&mut app, CommentKind::LooksGood);
+    assert!(!app.composing(), "the click submits");
+    let c = app.store.get(0).expect("a tag was saved");
+    assert_eq!(c.kind, CommentKind::LooksGood);
+    assert!(c.text.is_empty());
+    assert!(!c.sent);
+    assert_eq!(herdr_reviewr::export::format_comment(c), "### Annotation 1 (lines 2)\nLooks good");
+}
+
+#[test]
+fn a_toolbar_click_submits_delete_without_text() {
+    let mut app = composing_app();
+    click_toolbar(&mut app, CommentKind::Delete);
+    let c = app.store.get(0).expect("a tag was saved");
+    assert_eq!(c.kind, CommentKind::Delete);
+    assert!(c.text.is_empty());
+    assert_eq!(herdr_reviewr::export::format_comment(c), "### Annotation 1 (lines 2)\nRemove this");
+}
+
+#[test]
+fn a_toolbar_click_on_a_settled_span_keeps_the_columns() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    let new =
+        app.visible.iter().position(|row| row.marker() == '+' && row.text() == "BETA").unwrap();
+    let (c0, r0) = sel_cell(&app, new, 0);
+    let (c1, r1) = sel_cell(&app, new, 1);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
+    assert!(app.composing(), "the drag opened the composer");
+    assert!(app.settled_selection().is_some());
+    click_toolbar(&mut app, CommentKind::LooksGood);
+    let c = app.store.get(0).expect("a tag was saved");
+    assert_eq!(c.kind, CommentKind::LooksGood);
+    assert_eq!((c.start_col, c.end_col), (Some(1), Some(3)), "the click must not drop the span");
+    assert_eq!(c.lines, "BE");
+    assert!(
+        herdr_reviewr::export::format_comment(c).contains("Looks good: \"BE\""),
+        "{}",
+        herdr_reviewr::export::format_comment(c)
+    );
+}
+
+#[test]
+fn a_composing_double_click_does_not_retarget_the_span() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    let new =
+        app.visible.iter().position(|row| row.marker() == '+' && row.text() == "BETA").unwrap();
+    let (c0, r0) = sel_cell(&app, new, 0);
+    let (c1, r1) = sel_cell(&app, new, 1);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
+    assert!(app.composing());
+    let before = app.settled_selection().expect("the drag settled BE");
+    assert_eq!((before.anchor.chr, before.extent.chr), (0, 1));
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c0, r0);
+    assert!(app.composing(), "the composer stays");
+    let after = app.settled_selection().expect("the span stays");
+    assert_eq!(
+        (after.anchor.row, after.anchor.chr, after.extent.chr),
+        (before.anchor.row, before.anchor.chr, before.extent.chr),
+        "a double-click must not expand BE into BETA"
+    );
+    click_toolbar(&mut app, CommentKind::LooksGood);
+    let c = app.store.get(0).expect("a tag was saved");
+    assert_eq!((c.start_col, c.end_col, c.lines.as_str()), (Some(1), Some(3), "BE"));
+}
+
+fn toolbar_hits(app: &App, kind: CommentKind) -> Vec<(u16, u16)> {
+    let area = Rect::new(0, 0, 120, 40);
+    (0..area.height)
+        .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| herdr_reviewr::ui::hit_composer_toolbar(area, app, x, y) == Some(kind))
+        .collect()
+}
+
+#[test]
+fn a_span_toolbar_sits_above_the_first_line_around_the_last_char() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    let new =
+        app.visible.iter().position(|row| row.marker() == '+' && row.text() == "BETA").unwrap();
+    let (c0, r0) = sel_cell(&app, new, 0);
+    let (c1, r1) = sel_cell(&app, new, 1);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
+    assert!(app.composing());
+
+    let looks = toolbar_hits(&app, CommentKind::LooksGood);
+    let delete = toolbar_hits(&app, CommentKind::Delete);
+    assert!(!looks.is_empty(), "looks-good is clickable");
+    assert!(!delete.is_empty(), "delete is clickable");
+    let y = looks[0].1;
+    assert!(looks.iter().all(|&(_, row)| row == y), "looks-good is one row");
+    assert!(delete.iter().all(|&(_, row)| row == y), "delete shares that row");
+    assert_eq!(y, r0 - 1, "the bar floats on the row above; the selected line does not move");
+    let looks_max = looks.iter().map(|p| p.0).max().unwrap();
+    let delete_min = delete.iter().map(|p| p.0).min().unwrap();
+    assert_eq!(delete_min, looks_max + 1, "padded labels sit side by side");
+    let looks_min = looks.iter().map(|p| p.0).min().unwrap();
+    assert_eq!(looks_min, c1, "chip starts at the last character, like annotate");
+}
+
+#[test]
+fn a_whole_line_toolbar_sits_above_the_line_on_the_left() {
+    let app = composing_app();
+    let looks = toolbar_hits(&app, CommentKind::LooksGood);
+    let delete = toolbar_hits(&app, CommentKind::Delete);
+    assert!(!looks.is_empty());
+    let y = looks[0].1;
+    assert!(delete.iter().all(|&(_, row)| row == y));
+    let looks_min = looks.iter().map(|p| p.0).min().unwrap();
+    let looks_max = looks.iter().map(|p| p.0).max().unwrap();
+    let delete_min = delete.iter().map(|p| p.0).min().unwrap();
+    assert_eq!(delete_min, looks_max + 1, "padded labels sit side by side");
+    let inner = herdr_reviewr::ui::read_inner_rect(Rect::new(0, 0, 120, 40), &app);
+    assert_eq!(looks_min, inner.x + 5, "whole-line bar starts at the code column");
+    let cursor_y = sel_cell(&app, app.diff_cursor, 0).1;
+    assert_eq!(y, cursor_y - 1, "the bar floats on the row above the commented line");
+}
+
+#[test]
+fn a_multiline_span_toolbar_stays_above_the_first_line() {
+    let r = Repo::init();
+    r.write("a.rs", "alpha\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\none\ntwo\n");
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    let one =
+        app.visible.iter().position(|row| row.marker() == '+' && row.text() == "one").unwrap();
+    let two =
+        app.visible.iter().position(|row| row.marker() == '+' && row.text() == "two").unwrap();
+    let (c0, r0) = sel_cell(&app, one, 0);
+    let (c1, r1) = sel_cell(&app, two, 2); // last char of "two"
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
+    assert!(app.composing());
+
+    let looks = toolbar_hits(&app, CommentKind::LooksGood);
+    let delete = toolbar_hits(&app, CommentKind::Delete);
+    assert!(!looks.is_empty());
+    let y = looks[0].1;
+    assert_eq!(y, r0 - 1, "cross-line bar floats above the first line");
+    assert!(y < r1, "not above the last line");
+    let looks_max = looks.iter().map(|p| p.0).max().unwrap();
+    let delete_min = delete.iter().map(|p| p.0).min().unwrap();
+    assert_eq!(delete_min, looks_max + 1);
+    let looks_min = looks.iter().map(|p| p.0).min().unwrap();
+    assert_eq!(looks_min, c1, "chip starts at the last character");
+}
+
+#[test]
+fn a_wrapped_removed_span_toolbar_sits_above_that_segment() {
+    let r = Repo::init();
+    r.write(
+        "a.md",
+        "please only circle the words: the path was docs/skills/review-fix-loop/features-end\n",
+    );
+    r.commit_all("init");
+    r.write("a.md", "short\n");
+    let mut app = app_on(&r);
+    app.wrap = true;
+    app.focus = Focus::Diff;
+    let old = app.visible.iter().position(|row| row.marker() == '-').expect("removed line");
+
+    let backend = ratatui::backend::TestBackend::new(SEL_AREA.width, SEL_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| herdr_reviewr::ui::render(f, &app)).unwrap();
+    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let mut on_old = Vec::new();
+    for y in inner.y..inner.y.saturating_add(inner.height) {
+        if let Some(p) = herdr_reviewr::ui::read_point_at(SEL_AREA, &app, inner.x + 5, y)
+            && p.row == old
+        {
+            on_old.push(y);
+        }
+    }
+    assert!(on_old.len() >= 2, "the removed line must wrap, got {on_old:?}");
+    let path_y = on_old[1];
+    let c0 = inner.x + 5;
+    let c1 = inner.x + 5 + 8;
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, path_y);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, path_y);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, path_y);
+    assert!(app.composing());
+
+    let looks = toolbar_hits(&app, CommentKind::LooksGood);
+    assert!(!looks.is_empty(), "toolbar is clickable");
+    let y = looks[0].1;
+    assert_eq!(y, path_y - 1, "float above the wrap segment that was selected");
+    let looks_min = looks.iter().map(|p| p.0).min().unwrap();
+    assert!(
+        looks_min < inner.x + 5 + 20,
+        "x follows the wrapped last char, not the unwrapped column: {looks_min}"
+    );
+}
+
+#[test]
+fn a_green_wrapped_span_toolbar_does_not_cover_that_line() {
+    let r = Repo::init();
+    r.write(
+        "a.md",
+        "请只圈「review-fix-loop」这几个字：路径是 docs/skills/review-fix-loop/features。\n",
+    );
+    r.commit_all("init");
+    r.write(
+        "a.md",
+        "请只圈「review-fix-loop」这几个字：路径已改为 docs/skills/review-fix-loop/moved。\n",
+    );
+    let mut app = app_on(&r);
+    app.wrap = true;
+    app.focus = Focus::Diff;
+    let green = app
+        .visible
+        .iter()
+        .position(|row| row.marker() == '+' && row.text().contains("moved"))
+        .expect("added line");
+
+    let backend = ratatui::backend::TestBackend::new(SEL_AREA.width, SEL_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| herdr_reviewr::ui::render(f, &app)).unwrap();
+    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let mut on_green = Vec::new();
+    for y in inner.y..inner.y.saturating_add(inner.height) {
+        if let Some(p) = herdr_reviewr::ui::read_point_at(SEL_AREA, &app, inner.x + 5, y)
+            && p.row == green
+        {
+            on_green.push(y);
+        }
+    }
+    assert!(on_green.len() >= 2, "the added line must wrap, got {on_green:?}");
+    let path_y = *on_green.last().unwrap();
+    let c0 = inner.x + 5 + 12;
+    let c1 = inner.x + 5 + 12 + 15;
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, path_y);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, path_y);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, path_y);
+    assert!(app.composing());
+
+    let looks = toolbar_hits(&app, CommentKind::LooksGood);
+    assert!(!looks.is_empty(), "toolbar is clickable");
+    let y = looks[0].1;
+    assert_eq!(y, path_y - 1, "float above the selected wrap, not the whole logical line");
+
+    let backend = ratatui::backend::TestBackend::new(SEL_AREA.width, SEL_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| herdr_reviewr::ui::render(f, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let row: String = (0..SEL_AREA.width).map(|x| buf[(x, y)].symbol()).collect();
+    assert!(row.contains('👍'), "chip keeps 👍 over the CJK underneath: {row:?}");
+    assert!(row.contains('✗'), "chip keeps ✗ over the CJK underneath: {row:?}");
+    let delete = toolbar_hits(&app, CommentKind::Delete);
+    let x0 = looks.iter().map(|p| p.0).min().unwrap();
+    let x1 = delete.iter().map(|p| p.0).max().unwrap();
+    let chip = buf[(x0, y)].bg;
+    assert_ne!(chip, ratatui::style::Color::Reset, "the chip has a fill");
+    // ` 👍 ` is width 2; ratatui reset()s the follow cell, same as annotate.
+    let thumb_follow = x0.saturating_add(2);
+    let bgs: Vec<_> = (x0..=x1).filter(|&x| x != thumb_follow).map(|x| buf[(x, y)].bg).collect();
+    assert!(bgs.iter().all(|bg| *bg == chip), "one chip fill like annotate: {bgs:?}");
+    assert_eq!(buf[(x1.saturating_add(1), y)].bg, chip, "one pad cell after delete");
+    let after_pad = x1.saturating_add(2);
+    let after_snap = x1.saturating_add(3);
+    assert!(
+        buf[(after_pad, y)].bg != chip || buf[(after_snap, y)].bg != chip,
+        "at most one CJK snap cell after the pad"
+    );
+    let start = x0;
+    if start > 0 {
+        let prev = buf[(start - 1, y)].symbol();
+        assert!(
+            unicode_width::UnicodeWidthStr::width(prev) <= 1,
+            "a wide glyph before the chip skips the fill on flush: {prev:?}"
+        );
+    }
+}
+
+#[test]
+fn a_toolbar_stays_on_the_pane_after_unwrap() {
+    let r = Repo::init();
+    r.write("a.md", &format!("please only circle these words: {}\n", "word-end ".repeat(20)));
+    r.commit_all("init");
+    r.write("a.md", "short\n");
+    let mut app = app_on(&r);
+    app.wrap = true;
+    app.focus = Focus::Diff;
+    let old = app.visible.iter().position(|row| row.marker() == '-').expect("removed line");
+
+    let backend = ratatui::backend::TestBackend::new(SEL_AREA.width, SEL_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| herdr_reviewr::ui::render(f, &app)).unwrap();
+    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let mut on_old = Vec::new();
+    for y in inner.y..inner.y.saturating_add(inner.height) {
+        if let Some(p) = herdr_reviewr::ui::read_point_at(SEL_AREA, &app, inner.x + 5, y)
+            && p.row == old
+        {
+            on_old.push(y);
+        }
+    }
+    assert!(on_old.len() >= 2, "the removed line must wrap, got {on_old:?}");
+    let seg_last_y = *on_old.last().unwrap();
+    let c0 = inner.x + 5;
+    let c1 = inner.x + 5 + 8;
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, seg_last_y);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, seg_last_y);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, seg_last_y);
+    assert!(app.composing());
+    assert!(!toolbar_hits(&app, CommentKind::LooksGood).is_empty());
+
+    app.toggle_wrap();
+    assert!(!app.wrap, "w unwraps");
+
+    let looks = toolbar_hits(&app, CommentKind::LooksGood);
+    let delete = toolbar_hits(&app, CommentKind::Delete);
+    assert!(!looks.is_empty(), "👍 stays clickable after unwrap");
+    assert!(!delete.is_empty(), "❌ stays clickable after unwrap");
+    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let right = inner.x.saturating_add(inner.width);
+    assert!(
+        looks.iter().chain(delete.iter()).all(|&(x, _)| x < right),
+        "unwrap must not send the bar past the pane: looks={looks:?} delete={delete:?} right={right}"
+    );
+    let line_y = (inner.y..inner.y.saturating_add(inner.height)).find_map(|y| {
+        herdr_reviewr::ui::read_point_at(SEL_AREA, &app, inner.x + 5, y)
+            .filter(|p| p.row == old)
+            .map(|_| y)
+    });
+    let line_y = line_y.expect("the unwrapped line is on screen");
+    assert_eq!(looks[0].1, line_y - 1, "after unwrap the bar sits above the single line");
+}
+
+#[test]
+fn an_edit_composer_has_no_toolbar() {
+    let mut app = composing_app();
+    app.input = "keep".into();
+    app.submit_comment();
+    app.start_edit();
+    assert!(matches!(app.mode, Mode::Composing { editing: Some(_) }));
+    let area = Rect::new(0, 0, 120, 40);
+    let hit = (0..area.height)
+        .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| herdr_reviewr::ui::hit_composer_toolbar(area, &app, x, y).is_some());
+    assert_eq!(hit, None, "the edit box has no looks-good or delete button");
 }
 
 #[test]
@@ -1341,6 +1733,82 @@ fn comment_anchors_to_gits_real_line_numbers() {
 }
 
 #[test]
+fn a_settled_text_span_exports_line_col_and_excerpt() {
+    let r = Repo::init();
+    r.write("feat.feature", "review-fix-loop\n");
+    r.commit_all("init");
+    r.write("feat.feature", "review-fix-loop\nnext\n");
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    let row = app.visible.iter().position(|r| r.text().contains("review-fix-loop")).unwrap();
+    let (c0, r0) = sel_cell(&app, row, 0);
+    let (c1, r1) = sel_cell(&app, row, 14);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
+    assert_eq!(last_copy().as_deref(), Some("review-fix-loop"));
+    assert!(app.composing(), "a Read drag opens the composer on the span");
+    assert_eq!(app.diff_cursor, row, "the box sits under the selected row");
+    typed(&mut app, "拆到三个 Feature");
+    app.submit_comment();
+    let c = app.store.get(0).unwrap();
+    assert_eq!((c.start_col, c.end_col), (Some(1), Some(16)));
+    assert_eq!(c.lines, "review-fix-loop");
+    let out = herdr_reviewr::export::format_all(&[c]);
+    assert!(out.contains("审阅意见如下:"), "{out}");
+    assert!(out.contains("## feat.feature"), "{out}");
+    assert!(out.contains(&format!("(lines {}:1–{}:16)", c.start, c.end)), "{out}");
+    assert!(out.contains("Comment on: \"review-fix-loop\""), "{out}");
+    assert!(out.contains("> 拆到三个 Feature"), "{out}");
+}
+
+#[test]
+fn a_partial_select_on_each_side_of_a_replace_keeps_excerpt_after_typing() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    let old =
+        app.visible.iter().position(|row| row.marker() == '-' && row.text() == "beta").unwrap();
+    let new =
+        app.visible.iter().position(|row| row.marker() == '+' && row.text() == "BETA").unwrap();
+
+    // Green first: the card sits under +BETA and does not shift the red row's cells.
+    let (c0, r0) = sel_cell(&app, new, 0);
+    let (c1, r1) = sel_cell(&app, new, 1);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
+    assert_eq!(last_copy().as_deref(), Some("BE"));
+    assert_eq!(app.diff_cursor, new, "composer under the green row");
+    typed(&mut app, "new side span");
+    app.submit_comment();
+    let c = app.store.get(0).unwrap();
+    assert_eq!(c.side, Side::New);
+    assert_eq!((c.start_col, c.end_col), (Some(1), Some(3)));
+    assert_eq!(c.lines, "BE");
+    let out = herdr_reviewr::export::format_all(&[c]);
+    assert!(out.contains("(lines 2:1–2:3)"), "{out}");
+    assert!(out.contains("Comment on: \"BE\""), "{out}");
+
+    let (c0, r0) = sel_cell(&app, old, 0);
+    let (c1, r1) = sel_cell(&app, old, 1);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
+    assert_eq!(last_copy().as_deref(), Some("be"));
+    assert_eq!(app.diff_cursor, old, "composer under the red row");
+    typed(&mut app, "old side span");
+    app.submit_comment();
+    let c = app.store.get(1).unwrap();
+    assert_eq!(c.side, Side::Old);
+    assert_eq!((c.start_col, c.end_col), (Some(1), Some(3)));
+    assert_eq!(c.lines, "be");
+    let out = herdr_reviewr::export::format_all(&[c]);
+    assert!(out.contains("(lines 2:1–2:3, removed)"), "{out}");
+    assert!(out.contains("Comment on: \"be\""), "{out}");
+}
+
+#[test]
 fn comments_on_added_and_removed_lines_capture_the_snippet() {
     let r = edited_repo();
     let mut app = app_on(&r);
@@ -1415,29 +1883,109 @@ fn a_failed_export_keeps_comments_and_success_consumes_them() {
 
     let target = FakeTarget::ok();
     app.export(&target);
-    assert!(app.store.is_empty(), "a successful export consumes the comments");
+    assert_eq!(app.store.len(), 2, "a successful send keeps the cards");
+    assert!(app.store.iter().all(|c| c.sent), "the delivered comments are marked sent");
+    assert_eq!(app.unsent(), 0);
     assert_eq!(app.status, "exported 2 comments", "the target owns the success confirmation");
 
     // The sent text is the real export block format, end to end through App::export.
     let sent = target.last();
     assert!(sent.contains("one") && sent.contains("two"), "both comment texts present: {sent:?}");
-    assert!(sent.lines().next().is_some_and(|l| l.starts_with("a.rs:")), "leads with a location");
-    assert!(sent.contains("\n\n"), "blocks separated by a blank line: {sent:?}");
-    assert!(
-        sent.lines().any(|l| l.starts_with('+') || l.starts_with('-')),
-        "each block carries its diff snippet: {sent:?}"
-    );
+    assert!(sent.starts_with("审阅意见如下:"), "leads with the review header: {sent:?}");
+    assert!(sent.contains("## a.rs"), "groups by file: {sent:?}");
+    assert!(sent.contains("### Annotation 1"), "numbers annotations: {sent:?}");
+    assert!(sent.contains("> one") && sent.contains("> two"), "quotes each comment: {sent:?}");
 }
 
 #[test]
-fn send_consumes_the_whole_set() {
+fn a_copy_keeps_comments_so_they_can_still_be_edited() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "keep me");
+    comment_on(&mut app, '-', "and me");
+    assert_eq!(app.store.len(), 2);
+
+    let target = FakeTarget::copying();
+    assert!(app.export(&target), "copy reports success");
+    assert_eq!(app.store.len(), 2, "copy must not consume comments");
+    assert_eq!(app.status, "exported 2 comments");
+    let copied = target.last();
+    assert!(copied.contains("> keep me") && copied.contains("> and me"), "{copied:?}");
+
+    app.export(&FakeTarget::ok());
+    assert_eq!(app.store.len(), 2, "send after a copy still keeps the cards");
+    assert!(app.store.iter().all(|c| c.sent));
+}
+
+#[test]
+fn send_marks_pending_sent_and_a_second_send_is_inert() {
     let r = edited_repo();
     let mut app = app_on(&r);
     comment_on(&mut app, '+', "first");
     comment_on(&mut app, '-', "second");
 
+    let first = FakeTarget::ok();
+    app.export(&first);
+    assert_eq!(app.store.len(), 2, "send takes no card, only the pending mark");
+    assert!(app.store.iter().all(|c| c.sent));
+    assert!(first.last().contains("> first") && first.last().contains("> second"));
+
+    let second = FakeTarget::ok();
+    assert!(!app.export(&second), "nothing new to send");
+    assert_eq!(app.status, "no new comments");
+    assert!(second.last().is_empty(), "the agent is not pasted again");
+}
+
+#[test]
+fn editing_a_sent_comment_makes_it_pending_again() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "first");
     app.export(&FakeTarget::ok());
-    assert!(app.store.is_empty(), "send takes every comment, not just one");
+    assert!(app.store.get(0).unwrap().sent);
+
+    app.start_edit();
+    app.input = "revised".into();
+    app.submit_comment();
+    assert!(!app.store.get(0).unwrap().sent, "an edit is a new note");
+    assert_eq!(app.unsent(), 1);
+
+    let again = FakeTarget::ok();
+    app.export(&again);
+    assert!(again.last().contains("> revised"));
+    assert!(!again.last().contains("> first"), "only the edited body is sent");
+    assert!(app.store.get(0).unwrap().sent);
+}
+
+#[test]
+fn copy_includes_sent_comments_without_changing_sent() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "old");
+    app.export(&FakeTarget::ok());
+    comment_on(&mut app, '-', "new");
+    assert_eq!(app.unsent(), 1);
+
+    let target = FakeTarget::copying();
+    assert!(app.export(&target));
+    let copied = target.last();
+    assert!(copied.contains("> old") && copied.contains("> new"), "{copied:?}");
+    assert!(app.store.get(0).unwrap().sent, "copy does not flip sent");
+    assert!(!app.store.get(1).unwrap().sent, "the pending comment stays pending");
+}
+
+#[test]
+fn quit_asks_only_while_comments_are_pending() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "keep");
+    app.request_quit();
+    assert!(app.confirming_quit && !app.should_quit, "pending comments make `q` ask");
+    app.confirming_quit = false;
+
+    app.export(&FakeTarget::ok());
+    app.request_quit();
+    assert!(app.should_quit && !app.confirming_quit, "only sent comments do not block quit");
 }
 
 #[test]
@@ -1511,7 +2059,7 @@ fn a_comment_can_be_written_across_multiple_lines() {
     let target = FakeTarget::ok();
     app.export(&target);
     let sent = target.last();
-    assert!(sent.contains("first line\nsecond line"), "export preserves the break: {sent:?}");
+    assert!(sent.contains("> first line\n> second line"), "export quotes each line: {sent:?}");
     assert!(!sent.contains("\n\n\n"), "no blank-line run that could split a block");
 }
 
@@ -3177,13 +3725,11 @@ fn changed_count_and_staleness_stay_scope_based_on_all_files() {
     // A diff comment on b.rs, which is in the worktree but not in the changeset.
     let comment = Comment {
         file: "b.rs".into(),
-        side: Side::New,
         start: 1,
         end: 1,
         lines: " two".into(),
         text: "?".into(),
-        diff_anchored: true,
-        rev: herdr_reviewr::model::Rev::Worktree,
+        ..Comment::default()
     };
     app.store.add(comment.clone());
 
@@ -3375,9 +3921,14 @@ fn a_file_view_comment_exports_as_path_line_with_a_context_snippet() {
     let target = FakeTarget::ok();
     app.export(&target);
     let out = target.last();
-    assert!(out.contains("a.rs:2"), "header is path:line:\n{out}");
-    assert!(!out.contains("(removed)"), "a content comment never carries (removed):\n{out}");
-    assert!(out.contains(" beta"), "the snippet is the space-prefixed content line:\n{out}");
+    assert!(out.contains("## a.rs"), "groups under the file:\n{out}");
+    assert!(out.contains("(lines 2)"), "a single whole line:\n{out}");
+    assert!(!out.contains("removed"), "a content comment is not removed:\n{out}");
+    assert!(
+        !out.contains("Comment on:"),
+        "a whole-line new-side comment skips the excerpt:\n{out}"
+    );
+    assert!(out.contains("> why"), "the comment is quoted:\n{out}");
 }
 
 #[test]
@@ -6647,6 +7198,9 @@ impl ExportTarget for SelClipboard {
         SEL_COPIES.with(|c| c.borrow_mut().push(text.to_string()));
         Ok(())
     }
+    fn consumes_comments(&self) -> bool {
+        false
+    }
 }
 
 /// The last text [`SelClipboard`] captured on this test's thread.
@@ -6710,8 +7264,7 @@ fn a_release_on_the_mouse_down_cell_is_a_click_and_a_real_drag_copies() {
     assert_eq!(app.diff_cursor, 1, "a slip within the tab's cells still clicks");
     assert_eq!(app.status, "", "and copies nothing");
 
-    // TS-NO-REVIEW-STATE: a full drag-release cycle touches no review state.
-    let before = app.diff_cursor;
+    // A Read drag copies and opens the composer under the selected row.
     let (c0, r0) = sel_cell(&app, 0, 0);
     let (c2, r2) = sel_cell(&app, 2, 2);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
@@ -6719,8 +7272,8 @@ fn a_release_on_the_mouse_down_cell_is_a_click_and_a_real_drag_copies() {
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c2, r2);
     assert_eq!(app.store.len(), 0);
     assert!(app.select_anchor.is_none());
-    assert_eq!(app.mode, Mode::Normal);
-    assert_eq!(app.diff_cursor, before);
+    assert!(app.composing(), "a Read drag opens the composer");
+    assert_eq!(app.diff_cursor, 2, "the box sits under the span's last row");
     assert!(app.text_drag().is_none());
     assert_eq!(app.status, "copied 21 chars", "release reports the copy");
     assert_eq!(last_copy().as_deref(), Some("alpha beta\n\tif x {\n日本"));
@@ -6759,6 +7312,7 @@ fn ts_one_surface_a_drag_clamps_to_its_pane_and_skips_cards() {
     let text = last_copy().unwrap();
     assert_eq!(text, "alpha beta\n\tif x {\n日本 z");
     assert!(!text.contains("watch this"), "spanned cards contribute nothing");
+    press(&mut app, &Keymap::default(), KeyCode::Esc);
 
     // A drag that starts on the card selects that card's text, confined to it.
     app.status.clear();
@@ -6800,15 +7354,17 @@ fn the_gutter_click_and_drag_open_the_composer_and_stay_inert_while_composing() 
     assert!(!app.gutter_drag());
     assert!(app.text_drag().is_none());
 
-    // While composing, a double-click copies its word; the composer holds.
+    // While composing, a double-click is inert: it must not settle a word Kind would follow.
     let (c0, r0) = sel_cell(&app, 0, 0);
+    let copy_before = last_copy();
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c0, r0);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c0, r0);
     assert!(app.composing(), "the open composer survives a double-click");
     assert_eq!(app.selection_range(), (0, 0), "the draft's anchor never moves");
-    assert_eq!(last_copy().as_deref(), Some("alpha"), "the word still copies while composing");
+    assert!(app.settled_selection().is_none(), "a double-click does not settle a word");
+    assert_eq!(last_copy(), copy_before, "a double-click does not copy while composing");
     press(&mut app, &Keymap::default(), KeyCode::Esc);
     assert_eq!(app.mode, Mode::Normal);
 
@@ -6910,6 +7466,10 @@ fn a_settled_highlight_survives_an_unrelated_refresh_and_clears_when_its_text_ch
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c9, r0);
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c9, r0);
     assert!(app.settled_selection().is_some());
+    assert!(app.composing(), "a Read drag opens the composer");
+    press(&mut app, &Keymap::default(), KeyCode::Esc);
+    assert!(!app.composing());
+    assert!(app.settled_selection().is_some(), "Esc keeps the highlight so the span can reopen");
 
     // An unrelated new file refreshes the world and leaves the spanned text alone.
     r.write("other.rs", "unrelated\n");
@@ -6970,15 +7530,21 @@ fn a_drag_release_keeps_the_selection_until_the_next_mouse_down() {
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
     assert_eq!(app.status, "copied 10 chars");
     assert!(app.settled_selection().is_some(), "the release keeps the highlight as feedback");
+    assert!(app.composing(), "a Read drag opens the composer");
 
     // The wheel is reading, not doing something else: the highlight survives it.
     sel_mouse(&mut app, MouseEventKind::ScrollDown, c0, r0);
     assert!(app.settled_selection().is_some(), "scrolling keeps the settled highlight");
 
-    // The next mouse-down clears it before acting.
+    // While composing, a down must keep the span so 👍 / × can still read it.
     let (c2, r2) = sel_cell(&app, 2, 0);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c2, r2);
-    assert!(app.settled_selection().is_none(), "a mouse-down is the user doing something else");
+    assert!(app.settled_selection().is_some(), "composing keeps the span across a down");
+
+    press(&mut app, &Keymap::default(), KeyCode::Esc);
+    assert!(!app.composing());
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c2, r2);
+    assert!(app.settled_selection().is_none(), "a mouse-down after Esc is something else");
 }
 
 #[test]
@@ -7253,6 +7819,7 @@ fn a_completed_drag_resets_the_multi_click_chain() {
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c0, r0);
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c0, r0);
     assert_eq!(app.status, "copied 10 chars");
+    press(&mut app, &Keymap::default(), KeyCode::Esc);
     app.status.clear();
 
     // After a drag, the next press is a first click.
@@ -7300,6 +7867,7 @@ fn a_rendered_drag_selects_and_copies_through_the_read_surface() {
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c0 + 40, r0);
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c0 + 40, r0);
     assert_eq!(last_copy().as_deref(), Some("Title"), "the rendered heading copies");
+    press(&mut app, &Keymap::default(), KeyCode::Esc);
 
     // A drag across rows copies the rendered text, emphasis markers consumed.
     let (c2, r2) = sel_cell(&app, 2, 30);
@@ -7307,6 +7875,7 @@ fn a_rendered_drag_selects_and_copies_through_the_read_surface() {
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c2, r2);
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c2, r2);
     assert_eq!(last_copy().as_deref(), Some("Title\n\nplain body words changed"));
+    press(&mut app, &Keymap::default(), KeyCode::Esc);
 
     // A double copies the word under the cell; the rendered view never takes a comment.
     let (cw, rw) = sel_cell(&app, 2, 7);
@@ -8599,13 +9168,11 @@ fn editing_a_stale_comment_leaves_the_open_markdown_rendered() {
     // A comment on a file that left the changeset.
     app.store.add(herdr_reviewr::model::Comment {
         file: "gone.rs".into(),
-        side: Side::New,
         start: 1,
         end: 1,
         lines: "+x".into(),
         text: "note".into(),
-        diff_anchored: true,
-        rev: herdr_reviewr::model::Rev::Worktree,
+        ..herdr_reviewr::model::Comment::default()
     });
     app.open_list();
     app.start_edit();
@@ -9268,7 +9835,8 @@ fn a_removed_marker_comment_anchors_the_deleted_lines_on_the_old_side() {
     assert!(c.lines.contains("-gone para"), "{:?}", c.lines);
     assert!(!c.lines.contains("keep"), "a marker stands for its own lines alone");
     let out = herdr_reviewr::export::format_all(&[&c]);
-    assert!(out.contains("(removed)"), "{out}");
+    assert!(out.contains(", removed"), "{out}");
+    assert!(out.contains("Comment on: \"gone para\""), "{out}");
     // Its card sits under the marker.
     assert_eq!(app.card_rows(), vec![(marker, 0)]);
 
@@ -10155,7 +10723,8 @@ fn the_diff_agrees_with_git_diff_under_any_line_ending_rule() {
         app.submit_comment();
         let all: Vec<&herdr_reviewr::model::Comment> = app.store.iter().collect();
         let export = herdr_reviewr::export::format_all(&all);
-        assert!(export.contains(&lines[1]) && !export.contains('\r'), "{case}: {export:?}");
+        assert!(export.contains("why?") && !export.contains('\r'), "{case}: {export:?}");
+        assert!(export.contains("### Annotation"), "{case}: {export:?}");
 
         app.open_search();
         let results = herdr_reviewr::search::SearchResults {
@@ -10296,6 +10865,8 @@ fn a_cr_marker_is_paint_never_text() {
     assert_eq!(last_copy().as_deref(), Some("alpha"));
 
     // Snippet: the comment carries the line as the file has it.
+    press(&mut app, &Keymap::default(), KeyCode::Esc);
+    press(&mut app, &Keymap::default(), KeyCode::Char('j'));
     app.focus = Focus::Diff;
     app.diff_cursor = 1;
     app.start_comment();

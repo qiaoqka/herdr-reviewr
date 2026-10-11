@@ -140,6 +140,27 @@ pub enum Side {
     Old,
 }
 
+/// What the reviewer submitted: a written note, or a one-click tag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CommentKind {
+    #[default]
+    Comment,
+    LooksGood,
+    Delete,
+}
+
+impl CommentKind {
+    /// Paint order when several kinds cover one cell: Delete > Looks good > Comment.
+    #[must_use]
+    pub fn paint_rank(self) -> u8 {
+        match self {
+            CommentKind::Delete => 3,
+            CommentKind::LooksGood => 2,
+            CommentKind::Comment => 1,
+        }
+    }
+}
+
 /// A reviewer comment anchored to a run of diff lines, carrying the snippet.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Comment {
@@ -147,9 +168,18 @@ pub struct Comment {
     pub side: Side,
     pub start: u32,
     pub end: u32,
+    /// 1-based inclusive start column when the comment is a character span.
+    pub start_col: Option<u32>,
+    /// 1-based exclusive end column when the comment is a character span.
+    pub end_col: Option<u32>,
     /// Verbatim diff lines the comment anchors to, each keeping its `+`/`-`/space marker.
+    /// A character span stores the selected excerpt instead, with no markers.
     pub lines: String,
     pub text: String,
+    /// A written note, or a toolbar tag with empty body.
+    pub kind: CommentKind,
+    /// `false` until a successful send; copy never flips this.
+    pub sent: bool,
     /// A diff comment (`Changes`), else a content comment (`All files`).
     pub diff_anchored: bool,
     /// Where the new side was read.
@@ -167,6 +197,86 @@ impl Comment {
         match self.side {
             Side::New => range,
             Side::Old => format!("{range} (removed)"),
+        }
+    }
+
+    /// Whether this comment is a character span (划词), not a whole-line card.
+    #[must_use]
+    pub fn is_span(&self) -> bool {
+        self.start_col.is_some() && self.end_col.is_some()
+    }
+
+    /// The Kind decoration on 1-based `col` of `line_no`, if this comment paints that cell.
+    /// A whole-line Comment leaves no mark (the card is enough).
+    #[must_use]
+    pub fn kind_mark(&self, line_no: u32, col: u32) -> Option<CommentKind> {
+        if line_no < self.start || line_no > self.end {
+            return None;
+        }
+        if self.is_span() {
+            return self.span_covers(line_no, col).then_some(self.kind);
+        }
+        match self.kind {
+            CommentKind::Comment => None,
+            other => Some(other),
+        }
+    }
+
+    fn span_covers(&self, line_no: u32, col: u32) -> bool {
+        let (start_col, end_col) = match (self.start_col, self.end_col) {
+            (Some(s), Some(e)) => (s, e),
+            _ => return false,
+        };
+        if self.start == self.end {
+            return col >= start_col && col < end_col;
+        }
+        if line_no == self.start {
+            return col >= start_col;
+        }
+        if line_no == self.end {
+            return col < end_col;
+        }
+        true
+    }
+
+    /// Card and list body: typed text, or the tag when the body is empty.
+    pub fn card_text(&self) -> &str {
+        if !self.text.is_empty() {
+            return &self.text;
+        }
+        match self.kind {
+            CommentKind::LooksGood => "Looks good",
+            CommentKind::Delete => "Remove this",
+            CommentKind::Comment => "",
+        }
+    }
+}
+
+/// The strongest Kind mark among `comments` on this cell.
+#[must_use]
+pub fn strongest_kind_mark<'a>(
+    comments: impl IntoIterator<Item = &'a Comment>,
+    line_no: u32,
+    col: u32,
+) -> Option<CommentKind> {
+    comments.into_iter().filter_map(|c| c.kind_mark(line_no, col)).max_by_key(|k| k.paint_rank())
+}
+
+impl Default for Comment {
+    fn default() -> Self {
+        Self {
+            file: String::new(),
+            side: Side::New,
+            start: 1,
+            end: 1,
+            start_col: None,
+            end_col: None,
+            lines: String::new(),
+            text: String::new(),
+            kind: CommentKind::Comment,
+            sent: false,
+            diff_anchored: true,
+            rev: Rev::Worktree,
         }
     }
 }
@@ -219,12 +329,27 @@ impl CommentStore {
     }
 
     /// Replace the text of the comment at `index`. Returns `false` if out of range.
+    /// An edit is a new note: it drops `sent` and becomes a written `Comment`.
     pub fn edit(&mut self, index: usize, text: String) -> bool {
         if let Some(c) = self.items.get_mut(index) {
             c.text = text;
+            c.sent = false;
+            c.kind = CommentKind::Comment;
             true
         } else {
             false
+        }
+    }
+
+    /// Comments that a send still owes the agent.
+    pub fn pending_count(&self) -> usize {
+        self.items.iter().filter(|c| !c.sent).count()
+    }
+
+    /// Mark every pending comment sent, after a successful agent export.
+    pub fn mark_pending_sent(&mut self) {
+        for c in &mut self.items {
+            c.sent = true;
         }
     }
 
@@ -247,18 +372,16 @@ impl CommentStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{Comment, CommentStore, Rev, Scope, Side};
+    use super::{Comment, CommentStore, Scope, Side};
 
     fn comment(file: &str, start: u32, end: u32, text: &str) -> Comment {
         Comment {
             file: file.into(),
-            side: Side::New,
             start,
             end,
             lines: "+x".into(),
             text: text.into(),
-            diff_anchored: true,
-            rev: Rev::Worktree,
+            ..Comment::default()
         }
     }
 
@@ -329,5 +452,99 @@ mod tests {
         let three = s.add(comment("a.rs", 3, 3, "three"));
         assert_ne!(s.id(three), Some(id), "a fresh comment never takes an old id");
         assert_eq!(s.index_of(id), None);
+    }
+
+    #[test]
+    fn edit_clears_sent_and_becomes_a_written_comment() {
+        let mut s = CommentStore::new();
+        let mut c = comment("a.rs", 1, 1, "");
+        c.kind = super::CommentKind::LooksGood;
+        c.sent = true;
+        let i = s.add(c);
+        assert!(s.edit(i, "changed my mind".into()));
+        let got = s.get(i).unwrap();
+        assert!(!got.sent);
+        assert_eq!(got.kind, super::CommentKind::Comment);
+        assert_eq!(got.text, "changed my mind");
+    }
+
+    #[test]
+    fn mark_pending_sent_leaves_already_sent_comments() {
+        let mut s = CommentStore::new();
+        let mut sent = comment("a.rs", 1, 1, "old");
+        sent.sent = true;
+        s.add(sent);
+        s.add(comment("a.rs", 2, 2, "new"));
+        assert_eq!(s.pending_count(), 1);
+        s.mark_pending_sent();
+        assert_eq!(s.pending_count(), 0);
+        assert!(s.iter().all(|c| c.sent));
+    }
+
+    #[test]
+    fn a_whole_line_delete_marks_every_column() {
+        let mut c = comment("a.rs", 7, 7, "");
+        c.kind = super::CommentKind::Delete;
+        assert_eq!(c.kind_mark(7, 1), Some(super::CommentKind::Delete));
+        assert_eq!(c.kind_mark(7, 40), Some(super::CommentKind::Delete));
+        assert_eq!(c.kind_mark(8, 1), None);
+    }
+
+    #[test]
+    fn a_whole_line_looks_good_marks_every_column() {
+        let mut c = comment("a.rs", 7, 7, "");
+        c.kind = super::CommentKind::LooksGood;
+        assert_eq!(c.kind_mark(7, 1), Some(super::CommentKind::LooksGood));
+        assert_eq!(c.kind_mark(7, 40), Some(super::CommentKind::LooksGood));
+    }
+
+    #[test]
+    fn a_whole_line_comment_leaves_no_cell_mark() {
+        let c = comment("a.rs", 7, 7, "note");
+        assert_eq!(c.kind_mark(7, 1), None);
+    }
+
+    #[test]
+    fn a_span_marks_only_its_columns() {
+        let mut c = comment("a.rs", 7, 7, "BE");
+        c.start_col = Some(1);
+        c.end_col = Some(3);
+        c.kind = super::CommentKind::LooksGood;
+        assert_eq!(c.kind_mark(7, 1), Some(super::CommentKind::LooksGood));
+        assert_eq!(c.kind_mark(7, 2), Some(super::CommentKind::LooksGood));
+        assert_eq!(c.kind_mark(7, 3), None);
+    }
+
+    #[test]
+    fn a_multiline_span_covers_the_middle_whole() {
+        let mut c = comment("a.rs", 7, 9, "x");
+        c.start_col = Some(4);
+        c.end_col = Some(2);
+        c.kind = super::CommentKind::Delete;
+        assert_eq!(c.kind_mark(7, 3), None);
+        assert_eq!(c.kind_mark(7, 4), Some(super::CommentKind::Delete));
+        assert_eq!(c.kind_mark(8, 1), Some(super::CommentKind::Delete));
+        assert_eq!(c.kind_mark(9, 1), Some(super::CommentKind::Delete));
+        assert_eq!(c.kind_mark(9, 2), None);
+    }
+
+    #[test]
+    fn delete_wins_over_looks_good_and_comment() {
+        let mut del = comment("a.rs", 7, 7, "");
+        del.kind = super::CommentKind::Delete;
+        let mut ok = comment("a.rs", 7, 7, "");
+        ok.kind = super::CommentKind::LooksGood;
+        let mut note = comment("a.rs", 7, 7, "x");
+        note.start_col = Some(1);
+        note.end_col = Some(3);
+        assert_eq!(
+            super::strongest_kind_mark([&del, &ok, &note], 7, 1),
+            Some(super::CommentKind::Delete)
+        );
+        assert_eq!(
+            super::strongest_kind_mark([&ok, &note], 7, 1),
+            Some(super::CommentKind::LooksGood)
+        );
+        assert_eq!(super::strongest_kind_mark([&note], 7, 1), Some(super::CommentKind::Comment));
     }
 }

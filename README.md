@@ -30,6 +30,15 @@
 >   file still highlights both sides on the keystroke.
 > - A new turn (rest→work) publishes its start snapshot immediately, so last-turn empties
 >   until that turn writes. A question-only turn does not keep the previous turn's files.
+> - Send/copy: `审阅意见如下:` then `## file` and `### Annotation N (lines …)`. Whole-line
+>   new-side comments skip the excerpt. A Read drag opens the composer under that +/- row
+>   (`lines L:C–L:C` + `Comment on`). Typing keeps the span. New compose floats
+>   ` 👍 looks good` / ` ✗ delete` above the first selected wrap segment, from the
+>   last character's left edge plus one pad cell (whole-line `c`/gutter is
+>   left-aligned). Delete strikes the line; Looks good underlines it.
+>   `y`/`Y` copy the whole set without flipping `sent`. `S` sends
+>   pending only and marks those cards sent. Removed lines add `, removed`. Written notes
+>   are `>`; tags are `Looks good` / `Remove this` (quoted excerpt on a span).
 
 [![CI](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml/badge.svg)](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/persiyanov/herdr-reviewr)](https://github.com/persiyanov/herdr-reviewr/releases/latest)
